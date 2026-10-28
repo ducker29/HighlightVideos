@@ -110,20 +110,20 @@ class HighlightApp:
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=8)
-        self.button(actions, "1. Скачать и найти кандидатов", self.analyze, row=0, column=0, padx=(0, 8))
-        self.button(actions, "Открыть сохранённый отчёт…", self.load_report, row=0, column=1, padx=8)
-        self.button(actions, "2. Нарезать утверждённые…", self.render, row=0, column=2, padx=8)
+        self.button(actions, "Скачать и найти кандидатов", self.analyze, row=0, column=0, padx=(0, 8))
+        self.button(actions, "Открыть сохранённый отчёт", self.load_report, row=0, column=1, padx=8)
+        self.button(actions, "Нарезать утвержденные клипы", self.render, row=0, column=2, padx=8)
+        self.button(actions, "Применить запас к отчёту", self.apply_end_padding,
+                    row=0, column=3, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
-        self.progress.grid(row=0, column=3, padx=8)
-        self.button(actions, "Применить запас к отчёту…", self.apply_end_padding,
-                    row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.progress.grid(row=0, column=4, padx=8)
         ttk.Label(outer, textvariable=self.status, wraplength=1180).pack(fill="x", pady=(0, 5))
 
         panes = ttk.Panedwindow(outer, orient="vertical")
         panes.pack(fill="both", expand=True)
         table_frame = ttk.Frame(panes)
         columns = ("candidate_id", "status", "start", "end", "duration", "score", "title", "padding", "render")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=9, selectmode="browse")
+        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=8, selectmode="browse")
         for key, label, width in zip(columns, ("ID", "Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок", "Запас", "Нарезка"),
                                      (65, 110, 100, 100, 75, 60, 270, 65, 95)):
             self.table.heading(key, text=label)
@@ -156,14 +156,14 @@ class HighlightApp:
         self.button(decisions, "Отклонить", lambda: self.decide("rejected"), row=0, column=2, padx=3)
         self.button(decisions, "Посмотреть интервал (FFplay)", self.preview, row=0, column=3, padx=3)
         ttk.Label(review, text="Правки сохраняются кнопками выше. Изменённые границы требуют нового утверждения.").pack(anchor="w")
-        self.details = tk.Text(review, height=9, wrap="word", state="disabled")
+        self.details = tk.Text(review, height=12, wrap="word", state="disabled")
         self.details.tag_configure("context", foreground="#6b7280")
         self.details.tag_configure("marker", foreground="#1d4ed8")
         self.details.tag_configure("partial", foreground="#b45309")
         self.details.pack(fill="both", expand=True, pady=4)
         panes.add(review, weight=3)
         log_frame = ttk.LabelFrame(panes, text="Ход выполнения", padding=4)
-        self.logs = tk.Text(log_frame, height=7, wrap="word", state="disabled")
+        self.logs = tk.Text(log_frame, height=6, wrap="word", state="disabled")
         self.logs.pack(fill="both", expand=True)
         panes.add(log_frame, weight=1)
 
@@ -487,7 +487,7 @@ class HighlightApp:
         elif padding:
             padding_text = "Конец изменён вручную; автоматический запас повторно не добавляется.\n"
         else:
-            padding_text = "Запас к этому отчёту ещё не применён — доступна кнопка «Применить запас к отчёту…».\n"
+            padding_text = "Запас к этому отчёту ещё не применён — доступна кнопка «Применить запас к отчёту».\n"
         qa = ""
         if notes and abs(notes["start"] - candidate["start"]) < 0.001 and abs(notes["end"] - semantic_end) < 0.001:
             qa = "\n\nЗАМЕЧАНИЯ ТЕСТОВОГО ПРОГОНА К ЭТИМ ГРАНИЦАМ:\n" + "\n".join(notes["notes"])
