@@ -2,10 +2,11 @@
 from pathlib import Path
 import hashlib
 
-from analyzer import ask, interval_iou
+from analyzer import ModelValidationError, ask, interval_iou
 from job_store import load_json, save_json, validate_interval
+from llm_context import INITIAL_PROMPT_BYTES, byte_size, sentence_json
 
-REVIEW_VERSION = 2
+REVIEW_VERSION = 4
 SCHEMA = {"type": "object", "properties": {
     "decision": {"type": "string", "enum": ["keep", "revise", "reject"]},
     "start_id": {"type": "string"}, "end_id": {"type": "string"},
@@ -18,8 +19,6 @@ SCHEMA = {"type": "object", "properties": {
 
 
 def review_report(raw_report_path, log, model=None):
-    import json
-
     raw_report_path = Path(raw_report_path)
     raw = load_json(raw_report_path)
     transcript = load_json(raw_report_path.parent / "transcript.json")
@@ -36,7 +35,7 @@ def review_report(raw_report_path, log, model=None):
     if any(c["status"] != "pending" for c in raw["candidates"]):
         raise ValueError("Исходный отчёт уже содержит решения редактора. Повторная автоматическая правка не выполнена.")
     save_json(cache / "transcript.json", transcript)
-    kept, rejected = [], []
+    kept, rejected, warnings = [], [], []
     for index, candidate in enumerate(raw["candidates"]):
         log(f"Редакционная проверка: {index + 1}/{len(raw['candidates'])}")
         sentences = [s for s in transcript["sentences"]
@@ -77,14 +76,10 @@ def review_report(raw_report_path, log, model=None):
             decision = load_json(path)
             validate(decision)
         else:
-            def compact(items):
-                return json.dumps([{key: s[key] for key in ("id", "start", "end", "text")} for s in items],
-                                  ensure_ascii=False, separators=(',', ':'))
-
             before = [s for s in sentences if s["end"] <= candidate["start"]]
             inside = [s for s in sentences if s["start"] >= candidate["start"] and s["end"] <= candidate["end"]]
             after = [s for s in sentences if s["start"] >= candidate["end"]]
-            prompt = ("Проверь чужую монтажную заявку СКЕПТИЧЕСКИ. Предыдущий редактор часто ошибается. "
+            instructions = ("Проверь чужую монтажную заявку СКЕПТИЧЕСКИ. Предыдущий редактор часто ошибается. "
                       "Не пересказывай его обоснование и не считай его оценку доказательством качества. "
                       "Проверь ВСЕ предложения выбранного интервала, а также контекст до/после. "
                       "Нужен непрерывный горизонтальный хайлайт с одной законченной мыслью, не анонс и не набор тем. "
@@ -106,11 +101,44 @@ def review_report(raw_report_path, log, model=None):
                       f"Исходная заявка: start_id={candidate['start_id']}, end_id={candidate['end_id']}, "
                       f"длительность, ВЫЧИСЛЕННАЯ КОДОМ: {candidate['end'] - candidate['start']:.2f} секунд.\n"
                       f"Допустимая длина строго {settings['min_duration_sec']}–{settings['max_duration_sec']} секунд. "
-                      "Верни keep, revise либо reject и ID границ.\n"
-                      f"ДО КЛИПА (не входит в клип): {compact(before)}\n"
-                      f"КЛИП (именно его проверь): {compact(inside)}\n"
-                      f"ПОСЛЕ КЛИПА (не входит в клип): {compact(after)}")
-            decision = ask(settings, prompt, SCHEMA, validate, audit_path=cache / f"{candidate['candidate_id']}_attempts.json")
+                      "Верни keep, revise либо reject и ID границ.\n")
+
+            def build_prompt():
+                return (instructions + f"ДО КЛИПА (не входит в клип): {sentence_json(before)}\n"
+                        f"КЛИП (именно его проверь): {sentence_json(inside)}\n"
+                        f"ПОСЛЕ КЛИПА (не входит в клип): {sentence_json(after)}")
+
+            prompt = build_prompt()
+            # Trim only the farthest optional context; the selected clip stays complete.
+            while byte_size(prompt) > INITIAL_PROMPT_BYTES and (before or after):
+                if before and (not after or byte_size(sentence_json(before)) >= byte_size(sentence_json(after))):
+                    before.pop(0)
+                else:
+                    after.pop()
+                prompt = build_prompt()
+            if byte_size(prompt) > INITIAL_PROMPT_BYTES:
+                warning = (f"{candidate['candidate_id']}: полный текст клипа не помещается в редакционный запрос даже без "
+                           "соседнего контекста. Автоматическая проверка не выполнена; требуется ручное ревью.")
+                warnings.append(warning)
+                log(warning)
+                pending = dict(candidate, status="pending", editorial_decision="needs_review",
+                               warnings=list(candidate.get("warnings", [])) + [warning])
+                pending.pop("approval_key", None)
+                kept.append(pending)
+                continue
+            allowed = {s["id"]: s for s in before + inside + after}
+            try:
+                decision = ask(settings, prompt, SCHEMA, validate, audit_path=cache / f"{candidate['candidate_id']}_attempts.json")
+            except ModelValidationError:
+                warning = (f"{candidate['candidate_id']}: редактор трижды вернул недопустимое решение; "
+                           "исходные валидные границы сохранены для ручного ревью.")
+                warnings.append(warning)
+                log(warning)
+                pending = dict(candidate, status="pending", editorial_decision="needs_review",
+                               warnings=list(candidate.get("warnings", [])) + [warning])
+                pending.pop("approval_key", None)
+                kept.append(pending)
+                continue
             save_json(path, decision)
         if decision["decision"] == "reject":
             rejected.append({"candidate_id": candidate["candidate_id"], "reason": decision["reason"]})
@@ -131,6 +159,7 @@ def review_report(raw_report_path, log, model=None):
     report = dict(raw, signature=cache.name, candidates=ranked, editorial_version=REVIEW_VERSION,
                   settings=dict(raw["settings"], editorial_model=chosen_model),
                   editorial_context_tokens=settings["llm_context_tokens"],
+                  editorial_warnings=warnings,
                   raw_report_path=str(raw_report_path.resolve()), editorial_rejections=rejected)
     save_json(report_path, report)
     job_dir = raw_report_path.parent.parent.parent

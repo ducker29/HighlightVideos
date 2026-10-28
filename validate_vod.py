@@ -34,6 +34,7 @@ def run(stage):
         from transcriber import transcribe
         from app_backend import open_report, release_llm_for_asr
         from editorial_review import review_report
+        from clip_padding import prepare_review_report
         source = load_json(DATA / VIDEO_ID / "source.json")
         job_dir = DATA / VIDEO_ID / "validation_first30"
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -62,9 +63,10 @@ def run(stage):
         start = time.perf_counter()
         report_path = analyze(job_dir, transcript, settings, log)
         report_path = review_report(report_path, log, model=settings.get("editorial_model"))
+        report_path = prepare_review_report(report_path, settings.get("end_padding_sec", 0.5), log)
         context = open_report(report_path)
         for candidate in context["report"]["candidates"]:
-            validate_interval(candidate["start"], candidate["end"], 1800, 120, 300)
+            validate_interval(candidate["start"], candidate["end"], source["media"]["duration_sec"], 120, 300)
             if candidate["status"] != "pending":
                 log(f"Existing review decision preserved: {candidate['candidate_id']} ({candidate['status']})")
         result = {"report_path": str(report_path.resolve()), "candidate_count": len(context["report"]["candidates"]),

@@ -6,12 +6,14 @@ import subprocess
 import threading
 import traceback
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from analyzer import list_models
 from app_backend import open_report, run_analysis
-from job_store import DATA, ROOT, load_json, parse_time, save_json, timecode, validate_interval
-from renderer import approval_key, render_approved
+from job_store import DATA, ROOT, analysis_bounds, load_json, parse_time, save_json, timecode, validate_interval
+from renderer import approval_key, output_filename, render_approved
+from clip_padding import padding_seconds, prepare_review_report
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -31,8 +33,11 @@ class HighlightApp:
         if saved.exists():
             self.settings.update(load_json(saved))
         self.variables = {key: tk.StringVar(value=str(value)) for key, value in self.settings.items()}
+        self.variables["analyze_full_video"] = tk.BooleanVar(value=self.settings.get("analyze_full_video", True))
         self.status = tk.StringVar(value="Готово. Укажите ссылку и длительность, затем запустите анализ.")
         self._build()
+        self.variables["analyze_full_video"].trace_add("write", lambda *_: self.sync_analysis_range())
+        self.sync_analysis_range()
         self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -63,6 +68,8 @@ class HighlightApp:
         self.entry(settings, "min_duration_sec", 1, 1)
         ttk.Label(settings, text="до").grid(row=1, column=2)
         self.entry(settings, "max_duration_sec", 1, 3)
+        ttk.Label(settings, text="Запас в конце, с:").grid(row=1, column=4)
+        self.entry(settings, "end_padding_sec", 1, 5, 6, values=("0", "0.5", "1"))
         ttk.Label(settings, text="Whisper:").grid(row=2, column=0, sticky="w")
         self.entry(settings, "asr_model", 2, 1, values=("large-v3", "medium", "small"))
         ttk.Label(settings, text="Устройство:").grid(row=2, column=2)
@@ -79,6 +86,17 @@ class HighlightApp:
                                            values=(self.settings["editorial_model"],))
         self.editorial_choice.grid(columnspan=5)
 
+        scope = ttk.Frame(settings)
+        scope.grid(row=5, column=0, columnspan=6, sticky="ew", pady=4)
+        checkbox = ttk.Checkbutton(scope, text="Анализ полного видео", variable=self.variables["analyze_full_video"])
+        checkbox.grid(row=0, column=0, padx=(0, 12), sticky="w")
+        self.controls.append(checkbox)
+        ttk.Label(scope, text="с").grid(row=0, column=1)
+        self.range_start_entry = self.entry(scope, "analysis_start_min", 0, 2)
+        ttk.Label(scope, text="до").grid(row=0, column=3)
+        self.range_end_entry = self.entry(scope, "analysis_end_min", 0, 4)
+        ttk.Label(scope, text="мин от начала исходного видео").grid(row=0, column=5, padx=5)
+
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=8)
         self.button(actions, "1. Скачать и найти кандидатов", self.analyze, row=0, column=0, padx=(0, 8))
@@ -86,15 +104,17 @@ class HighlightApp:
         self.button(actions, "2. Нарезать утверждённые…", self.render, row=0, column=2, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
         self.progress.grid(row=0, column=3, padx=8)
+        self.button(actions, "Применить запас к отчёту…", self.apply_end_padding,
+                    row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(outer, textvariable=self.status, wraplength=1180).pack(fill="x", pady=(0, 5))
 
         panes = ttk.Panedwindow(outer, orient="vertical")
         panes.pack(fill="both", expand=True)
         table_frame = ttk.Frame(panes)
-        columns = ("status", "start", "end", "duration", "score", "title")
+        columns = ("candidate_id", "status", "start", "end", "duration", "score", "title")
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=9, selectmode="browse")
-        for key, label, width in zip(columns, ("Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок"),
-                                     (120, 115, 115, 85, 70, 480)):
+        for key, label, width in zip(columns, ("ID", "Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок"),
+                                     (75, 120, 115, 115, 85, 70, 405)):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, stretch=(key == "title"))
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
@@ -155,7 +175,30 @@ class HighlightApp:
         self.busy = False
         for control in self.controls:
             control.state(["!disabled"])
+        self.sync_analysis_range()
         self.progress.stop()
+
+    def sync_analysis_range(self):
+        disabled = self.busy or self.variables["analyze_full_video"].get()
+        for entry in (self.range_start_entry, self.range_end_entry):
+            entry.state(["disabled"] if disabled else ["!disabled"])
+
+    def restore_report_settings(self, context):
+        settings = context["report"]["settings"]
+        for key, value in settings.items():
+            if key in self.variables:
+                self.variables[key].set(value)
+        # Reports produced before the UI range controls still know their actual ASR range.
+        if "analyze_full_video" not in settings:
+            interval = context["transcript"].get("analysis_range")
+            if interval:
+                duration = context["manifest"]["media"]["duration_sec"]
+                self.variables["analyze_full_video"].set(interval["start"] == 0 and abs(interval["end"] - duration) < 0.001)
+                self.variables["analysis_start_min"].set(f"{interval['start'] / 60:.12g}")
+                self.variables["analysis_end_min"].set(f"{interval['end'] / 60:.12g}")
+            else:
+                self.variables["analyze_full_video"].set(True)
+        self.sync_analysis_range()
 
     def _poll(self):
         try:
@@ -178,10 +221,10 @@ class HighlightApp:
                         self.status.set("Доступные модели: " + ", ".join(result))
                     elif isinstance(result, dict) and "report" in result:
                         self.context = result
-                        for key, value in result["report"]["settings"].items():
-                            if key in self.variables:
-                                self.variables[key].set(str(value))
+                        self.restore_report_settings(result)
                         self.refresh_table()
+                        for warning in result["report"].get("analysis_warnings", []) + result["report"].get("editorial_warnings", []):
+                            self.append_log(warning)
                         rejections = result["report"].get("editorial_rejections", [])
                         if rejections:
                             self.append_log("Редакционная проверка отклонила кандидатов:")
@@ -191,7 +234,11 @@ class HighlightApp:
                         interval = result["transcript"].get("analysis_range")
                         scope = (f" Анализ: {timecode(interval['start'])}–{timecode(interval['end'])}." if interval else "")
                         self.status.set(f"{result['manifest']['title']} — кандидатов: {len(result['report']['candidates'])}.{scope} Ожидается ревью.")
+                        if result["report"].get("analysis_complete") is False:
+                            self.status.set(self.status.get() + " Есть блоки с неполным отбором — см. журнал.")
                     else:
+                        if self.context and not self.has_unsaved_edits():
+                            self.show_candidate()
                         self.status.set(f"Готово. Создано клипов: {len(result)}.")
                         messagebox.showinfo("Рендер завершён", "\n".join(result), parent=self.root)
         except queue.Empty:
@@ -205,7 +252,13 @@ class HighlightApp:
         self.logs.configure(state="disabled")
 
     def read_settings(self):
-        settings = {key: variable.get().strip() for key, variable in self.variables.items()}
+        settings = {key: variable.get().strip() for key, variable in self.variables.items() if key != "analyze_full_video"}
+        settings["analyze_full_video"] = self.variables["analyze_full_video"].get()
+        settings["end_padding_sec"] = padding_seconds(settings["end_padding_sec"])
+        analysis_bounds(settings)
+        if not settings["analyze_full_video"]:
+            for key in ("analysis_start_min", "analysis_end_min"):
+                settings[key] = float(settings[key].replace(",", "."))
         for key in ("min_duration_sec", "max_duration_sec"):
             settings[key] = int(settings[key])
         if not 1 <= settings["min_duration_sec"] <= settings["max_duration_sec"] <= 480:
@@ -235,6 +288,29 @@ class HighlightApp:
         if path:
             self.start_worker("Загрузка отчёта…", lambda: open_report(path))
 
+    def apply_end_padding(self):
+        if self.busy:
+            return
+        if not self.context:
+            messagebox.showinfo("Запас в конце", "Сначала получите или откройте отчёт кандидатов.", parent=self.root)
+            return
+        if self.has_unsaved_edits():
+            messagebox.showinfo("Ревью", "Сначала сохраните правки выбранного кандидата.", parent=self.root)
+            return
+        try:
+            seconds = padding_seconds(self.variables["end_padding_sec"].get())
+        except ValueError as exc:
+            messagebox.showerror("Запас в конце", str(exc), parent=self.root)
+            return
+        if any(c["status"] == "approved" for c in self.context["report"]["candidates"]):
+            if not messagebox.askyesno("Повторное утверждение границ",
+                                       "Если запас изменит утверждённые интервалы, потребуется утвердить их заново.\n"
+                                       "Исходный отчёт сохранится. Продолжить?", parent=self.root):
+                return
+        source_path = self.context["report_path"]
+        self.start_worker("Добавление запаса к концам клипов…",
+                          lambda: open_report(prepare_review_report(source_path, seconds, self.log)))
+
     def current_candidate(self):
         selected = self.table.selection()
         if not selected or not self.context:
@@ -245,7 +321,7 @@ class HighlightApp:
         self.table.delete(*self.table.get_children())
         for candidate in self.context["report"]["candidates"]:
             self.table.insert("", "end", iid=candidate["candidate_id"], values=(
-                STATUS.get(candidate["status"], candidate["status"]), timecode(candidate["start"]), timecode(candidate["end"]),
+                candidate["candidate_id"], STATUS.get(candidate["status"], candidate["status"]), timecode(candidate["start"]), timecode(candidate["end"]),
                 round(candidate["end"] - candidate["start"], 2), candidate["score"], candidate["title"]))
         children = self.table.get_children()
         if children:
@@ -273,10 +349,24 @@ class HighlightApp:
         text = "\n".join(f"[{timecode(s['start'])}] {s['text']}" for s in sentences
                          if s["end"] > candidate["start"] and s["start"] < candidate["end"])
         notes = self.context.get("quality_notes", {}).get(candidate["candidate_id"], {})
+        padding = candidate.get("end_padding")
+        semantic_end = candidate["end"]
+        if padding and abs(candidate["end"] - padding["padded_end"]) < 0.000001:
+            semantic_end = padding["base_end"]
+            padding_text = (f"Конец до запаса: {timecode(semantic_end)}; "
+                            f"добавлен запас {padding['applied_sec']:g} с (запрошен {padding['requested_sec']:g} с).\n")
+        elif padding:
+            padding_text = "Конец изменён вручную; автоматический запас повторно не добавляется.\n"
+        else:
+            padding_text = "Запас к этому отчёту ещё не применён — доступна кнопка «Применить запас к отчёту…».\n"
         qa = ""
-        if notes and abs(notes["start"] - candidate["start"]) < 0.001 and abs(notes["end"] - candidate["end"]) < 0.001:
+        if notes and abs(notes["start"] - candidate["start"]) < 0.001 and abs(notes["end"] - semantic_end) < 0.001:
             qa = "\n\nЗАМЕЧАНИЯ ТЕСТОВОГО ПРОГОНА К ЭТИМ ГРАНИЦАМ:\n" + "\n".join(notes["notes"])
-        self.set_details(f"Почему выбран: {candidate['reason']}\n"
+        output_dir = (Path(self.context["job_dir"]) / "output" / self.context["report"]["signature"]
+                      if "job_dir" in self.context and "signature" in self.context["report"] else None)
+        self.set_details(f"ID: {candidate['candidate_id']}\nИмя следующего файла: {output_filename(candidate, output_dir)}\n"
+                         + padding_text + "\n"
+                         f"Почему выбран: {candidate['reason']}\n"
                          + "\n".join(candidate.get("warnings", [])) + qa + "\n\n" + text)
 
     def edited_candidate(self):
@@ -329,7 +419,9 @@ class HighlightApp:
         if not approved:
             messagebox.showinfo("Нарезка", "Сначала утвердите хотя бы один интервал.", parent=self.root)
             return
-        intervals = "\n".join(f"{c['candidate_id']}: {timecode(c['start'])} — {timecode(c['end'])}" for c in approved)
+        output_dir = Path(self.context["job_dir"]) / "output" / report["signature"]
+        intervals = "\n".join(f"{c['candidate_id']}: {timecode(c['start'])} — {timecode(c['end'])}\n"
+                              f"{output_filename(c, output_dir)}" for c in approved)
         if not messagebox.askyesno("Разрешение на финальную нарезку",
                                    f"Нарезать утверждённые интервалы ({len(approved)} шт.)?\n{intervals}\n\n"
                                    "Будет сохранён полный горизонтальный кадр без кропа.", parent=self.root):

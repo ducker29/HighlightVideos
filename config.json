@@ -1,7 +1,11 @@
 {
   "youtube_url": "https://www.youtube.com/watch?v=AVbz4UzkeTw",
+  "analyze_full_video": true,
+  "analysis_start_min": 0,
+  "analysis_end_min": 30,
   "min_duration_sec": 120,
   "max_duration_sec": 300,
+  "end_padding_sec": 0.5,
   "asr_model": "large-v3",
   "device": "cuda",
   "language": "ru",
