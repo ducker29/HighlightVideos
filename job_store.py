@@ -8,6 +8,16 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 
 
+def padding_seconds(value):
+    try:
+        seconds = float(str(value).replace(",", "."))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Запас в конце укажите числом секунд от 0 до 5.") from exc
+    if not math.isfinite(seconds) or not 0 <= seconds <= 5:
+        raise ValueError("Запас в конце должен быть конечным числом от 0 до 5 секунд.")
+    return round(seconds, 3)
+
+
 def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 

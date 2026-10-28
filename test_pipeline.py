@@ -16,6 +16,7 @@ from downloader import probe
 from job_store import analysis_bounds, load_json, save_json, validate_interval
 from renderer import approval_key, output_filename, render_approved
 from clip_padding import padding_seconds, prepare_review_report
+from interval_builder import make_interval
 
 
 class CandidateTests(unittest.TestCase):
@@ -65,7 +66,7 @@ class CandidateTests(unittest.TestCase):
             transcript = {"video_id": "test", "duration_sec": 700, "sentences": sentences}
             save_json(job / "source.json", {"video_id": "test"})
             with patch("analyzer.ollama_request", side_effect=fake_http):
-                path = analyze(job, transcript, settings, lambda message: None)
+                path = analyze(job, transcript, settings, lambda message: None, selection_method="legacy")
             report = load_json(path)
             self.assertTrue(invalid_sent)
             self.assertTrue(checked_repair)
@@ -80,7 +81,7 @@ class CandidateTests(unittest.TestCase):
             report["candidates"][0]["status"] = "rejected"
             save_json(path, report)
             with patch("analyzer.ollama_request", side_effect=AssertionError("Cache contacted LLM")):
-                self.assertEqual(analyze(job, transcript, settings, lambda message: None), path)
+                self.assertEqual(analyze(job, transcript, settings, lambda message: None, selection_method="legacy"), path)
             # Reprocessing ASR must not change the transcript shown in an older review.
             save_json(job / "transcript.json", {"sentences": []})
             loaded = open_report(path)
@@ -150,7 +151,7 @@ class ModelRecoveryTests(unittest.TestCase):
             with patch("analyzer.ollama_request", side_effect=transport):
                 path = analyze(Path(temp), {"video_id": "test", "duration_sec": 500, "sentences": sentences},
                                {"llm_model": "test", "ollama_url": "unused", "min_duration_sec": 120,
-                                "max_duration_sec": 300}, lambda message: None)
+                                "max_duration_sec": 300}, lambda message: None, selection_method="legacy")
             report = load_json(path)
             self.assertTrue(report["candidates"])
             self.assertTrue(all(c["start"] >= 120 for c in report["candidates"]))
@@ -225,7 +226,7 @@ class ContextBudgetTests(unittest.TestCase):
             with patch("analyzer.ollama_request", side_effect=transport):
                 path = analyze(Path(temp), {"video_id": "test", "duration_sec": 300, "sentences": sentences},
                                {"llm_model": "test", "ollama_url": "unused", "min_duration_sec": 10,
-                                "max_duration_sec": 30}, lambda message: None)
+                                "max_duration_sec": 30}, lambda message: None, selection_method="legacy")
             self.assertTrue(load_json(path)["candidates"])
         self.assertEqual(window_ids, {s["id"] for s in sentences})
         self.assertEqual(clip_ids, window_ids)
@@ -656,7 +657,10 @@ class RenderIntegrationTests(unittest.TestCase):
             decoded = decode_audio(str(source), sampling_rate=16000)
             self.assertAlmostEqual(len(decoded) / 16000, 5.0, delta=0.05)
             manifest = {"source_path": str(source), "video_id": "synthetic", "media": probe(source)}
-            clip = {"candidate_id": "c001", "start": 0.8, "end": 3.8, "title": "Тема/Заголовок: тест?", "status": "pending"}
+            option = make_interval({"id": "begin", "start": 0.8}, {"id": "end", "start": 3.5, "end": 3.8},
+                                   manifest["media"]["duration_sec"],
+                                   {"min_duration_sec": 1, "max_duration_sec": 4, "end_padding_sec": 0.5})
+            clip = dict(option, candidate_id="c001", title="Тема/Заголовок: тест?", status="pending")
             report = {"signature": "test", "settings": {"min_duration_sec": 1, "max_duration_sec": 4}, "candidates": [clip]}
             with self.assertRaises(ValueError):
                 render_approved(manifest, report, job, lambda message: None)

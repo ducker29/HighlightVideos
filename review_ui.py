@@ -14,6 +14,8 @@ from app_backend import open_report, run_analysis
 from job_store import DATA, ROOT, analysis_bounds, load_json, parse_time, save_json, timecode, validate_interval
 from renderer import approval_key, output_filename, render_approved
 from clip_padding import padding_seconds, prepare_review_report
+from ui_editing import install_editing
+from transcript_review import review_sections, transcript_chunks
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -25,8 +27,11 @@ class HighlightApp:
         self.root.geometry("1250x900")
         self.root.minsize(1000, 700)
         self.events = queue.Queue()
+        self._poll_timers = set()
+        self._closed = False
         self.busy = False
         self.context = None
+        self._loading_candidate = False
         self.controls = []
         self.settings = load_json(ROOT / "config.json")
         saved = DATA / "ui_settings.json"
@@ -36,9 +41,12 @@ class HighlightApp:
         self.variables["analyze_full_video"] = tk.BooleanVar(value=self.settings.get("analyze_full_video", True))
         self.status = tk.StringVar(value="Готово. Укажите ссылку и длительность, затем запустите анализ.")
         self._build()
+        self.start.trace_add("write", self._review_bounds_changed)
+        self.end.trace_add("write", self._review_bounds_changed)
         self.variables["analyze_full_video"].trace_add("write", lambda *_: self.sync_analysis_range())
         self.sync_analysis_range()
-        self.root.after(100, self._poll)
+        self.root.bind("<Destroy>", self._on_destroy, add="+")
+        self._queue_poll()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def button(self, parent, text, command, **layout):
@@ -53,6 +61,7 @@ class HighlightApp:
         else:
             widget = ttk.Entry(parent, textvariable=self.variables[key], width=width)
         widget.grid(row=row, column=column, sticky="ew", padx=5, pady=4)
+        install_editing(widget)
         self.controls.append(widget)
         return widget
 
@@ -63,7 +72,9 @@ class HighlightApp:
         settings.pack(fill="x")
         settings.columnconfigure(1, weight=1)
         ttk.Label(settings, text="YouTube VOD:").grid(row=0, column=0, sticky="w")
-        self.entry(settings, "youtube_url", 0, 1, 65).grid(columnspan=5)
+        self.url_entry = self.entry(settings, "youtube_url", 0, 1, 65)
+        self.url_entry.grid(columnspan=4)
+        self.button(settings, "Вставить", self.paste_url, row=0, column=5, padx=5)
         ttk.Label(settings, text="Длительность, секунды: от").grid(row=1, column=0, sticky="w")
         self.entry(settings, "min_duration_sec", 1, 1)
         ttk.Label(settings, text="до").grid(row=1, column=2)
@@ -134,6 +145,7 @@ class HighlightApp:
             ttk.Label(fields, text=label).grid(row=0, column=column * 2, padx=3)
             widget = ttk.Entry(fields, textvariable=variable, width=width)
             widget.grid(row=0, column=column * 2 + 1, sticky="ew", padx=3)
+            install_editing(widget)
             self.controls.append(widget)
         fields.columnconfigure(5, weight=1)
         decisions = ttk.Frame(review)
@@ -144,6 +156,9 @@ class HighlightApp:
         self.button(decisions, "Посмотреть интервал (FFplay)", self.preview, row=0, column=3, padx=3)
         ttk.Label(review, text="Правки сохраняются кнопками выше. Изменённые границы требуют нового утверждения.").pack(anchor="w")
         self.details = tk.Text(review, height=9, wrap="word", state="disabled")
+        self.details.tag_configure("context", foreground="#6b7280")
+        self.details.tag_configure("marker", foreground="#1d4ed8")
+        self.details.tag_configure("partial", foreground="#b45309")
         self.details.pack(fill="both", expand=True, pady=4)
         panes.add(review, weight=3)
         log_frame = ttk.LabelFrame(panes, text="Ход выполнения", padding=4)
@@ -153,6 +168,21 @@ class HighlightApp:
 
     def log(self, message):
         self.events.put(("log", str(message)))
+
+    def paste_url(self):
+        if self.busy or self.url_entry.instate(["disabled"]) or self.url_entry.instate(["readonly"]):
+            return
+        try:
+            text = self.root.clipboard_get().strip()
+        except tk.TclError:
+            self.status.set("В буфере обмена нет доступного текста.")
+            return
+        if not text:
+            self.status.set("В буфере обмена пустой текст.")
+            return
+        self.variables["youtube_url"].set(text)
+        self.url_entry.focus_set()
+        self.url_entry.icursor(tk.END)
 
     def start_worker(self, operation, function):
         if self.busy:
@@ -233,9 +263,14 @@ class HighlightApp:
                             self.append_log(f"Исходный отбор сохранён: {result['report'].get('raw_report_path', '')}")
                         interval = result["transcript"].get("analysis_range")
                         scope = (f" Анализ: {timecode(interval['start'])}–{timecode(interval['end'])}." if interval else "")
+                        if result["report"].get("analysis_scope", {}).get("label"):
+                            scope += " " + result["report"]["analysis_scope"]["label"] + "."
                         self.status.set(f"{result['manifest']['title']} — кандидатов: {len(result['report']['candidates'])}.{scope} Ожидается ревью.")
                         if result["report"].get("analysis_complete") is False:
-                            self.status.set(self.status.get() + " Есть блоки с неполным отбором — см. журнал.")
+                            note = (" Это проверочный отбор выбранных блоков, не всего VOD."
+                                    if result["report"].get("probe_only") else
+                                    " Есть блоки с неполным отбором — см. журнал.")
+                            self.status.set(self.status.get() + note)
                     else:
                         if self.context and not self.has_unsaved_edits():
                             self.show_candidate()
@@ -243,7 +278,26 @@ class HighlightApp:
                         messagebox.showinfo("Рендер завершён", "\n".join(result), parent=self.root)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
+        self._queue_poll()
+
+    def _queue_poll(self):
+        if self._closed:
+            return
+        timer = None
+
+        def poll_once():
+            self._poll_timers.discard(timer)
+            self._poll()
+
+        timer = self.root.after(100, poll_once)
+        self._poll_timers.add(timer)
+
+    def _on_destroy(self, event):
+        if event.widget is self.root:
+            self._closed = True
+            for timer in list(self._poll_timers):
+                self.root.after_cancel(timer)
+            self._poll_timers.clear()
 
     def append_log(self, message):
         self.logs.configure(state="normal")
@@ -332,22 +386,48 @@ class HighlightApp:
             self.title.set("")
             self.set_details("Подходящих кандидатов не найдено. Произвольные интервалы не создаются.")
 
-    def set_details(self, text):
+    def set_details(self, text, chunks=None):
         self.details.configure(state="normal")
         self.details.delete("1.0", "end")
         self.details.insert("end", text)
+        for tag, content in chunks or []:
+            self.details.insert("end", content, (tag,))
         self.details.configure(state="disabled")
 
     def show_candidate(self):
         candidate = self.current_candidate()
         if not candidate:
             return
-        self.start.set(timecode(candidate["start"]))
-        self.end.set(timecode(candidate["end"]))
-        self.title.set(candidate["title"])
-        sentences = self.context["transcript"]["sentences"]
-        text = "\n".join(f"[{timecode(s['start'])}] {s['text']}" for s in sentences
-                         if s["end"] > candidate["start"] and s["start"] < candidate["end"])
+        self._loading_candidate = True
+        try:
+            self.start.set(timecode(candidate["start"]))
+            self.end.set(timecode(candidate["end"]))
+            self.title.set(candidate["title"])
+        finally:
+            self._loading_candidate = False
+        self._update_candidate_details()
+
+    def _review_bounds_changed(self, *_):
+        if not self._loading_candidate:
+            self._update_candidate_details(preserve_scroll=True)
+
+    def _update_candidate_details(self, preserve_scroll=False):
+        current = self.current_candidate()
+        if not current:
+            return
+        try:
+            start, end = validate_interval(parse_time(self.start.get()), parse_time(self.end.get()),
+                                           self.context["manifest"]["media"]["duration_sec"])
+        except (ValueError, OverflowError):
+            self.set_details("Границы редактируются. Введите корректные начало и конец — текст и контекст обновятся автоматически. "
+                             "Изменения ещё не сохранены.")
+            return
+        candidate = dict(current, start=start, end=end)
+        draft_bounds = abs(start - current["start"]) > 0.000001 or abs(end - current["end"]) > 0.000001
+        if draft_bounds:
+            candidate["manual_bounds"] = True
+        sections = review_sections(self.context["transcript"], start, end)
+        old_scroll = self.details.yview()[0] if preserve_scroll else 0
         notes = self.context.get("quality_notes", {}).get(candidate["candidate_id"], {})
         padding = candidate.get("end_padding")
         semantic_end = candidate["end"]
@@ -364,10 +444,17 @@ class HighlightApp:
             qa = "\n\nЗАМЕЧАНИЯ ТЕСТОВОГО ПРОГОНА К ЭТИМ ГРАНИЦАМ:\n" + "\n".join(notes["notes"])
         output_dir = (Path(self.context["job_dir"]) / "output" / self.context["report"]["signature"]
                       if "job_dir" in self.context and "signature" in self.context["report"] else None)
+        catalog_id = candidate.get("selection_interval_id") or candidate.get("interval_id")
+        catalog_text = f"Выбор PASS 2 (interval_id): {catalog_id}.\n" if catalog_id else ""
+        if catalog_id and candidate.get("manual_bounds"):
+            catalog_text += "Границы после выбора были изменены вручную.\n"
+        draft_text = "ПРЕДПРОСМОТР: изменённые границы ещё не сохранены.\n" if draft_bounds else ""
         self.set_details(f"ID: {candidate['candidate_id']}\nИмя следующего файла: {output_filename(candidate, output_dir)}\n"
-                         + padding_text + "\n"
+                         + draft_text + catalog_text + padding_text + "\n"
                          f"Почему выбран: {candidate['reason']}\n"
-                         + "\n".join(candidate.get("warnings", [])) + qa + "\n\n" + text)
+                         + "\n".join(candidate.get("warnings", [])) + qa + "\n\n",
+                         chunks=transcript_chunks(sections))
+        self.details.yview_moveto(old_scroll)
 
     def edited_candidate(self):
         current = self.current_candidate()
@@ -378,6 +465,10 @@ class HighlightApp:
                                        self.context["manifest"]["media"]["duration_sec"],
                                        settings["min_duration_sec"], settings["max_duration_sec"])
         candidate = dict(current, start=start, end=end, title=self.title.get().strip())
+        if "duration_sec" in candidate:
+            candidate["duration_sec"] = end - start
+        if abs(start - current["start"]) > 0.000001 or abs(end - current["end"]) > 0.000001:
+            candidate["manual_bounds"] = True
         if not candidate["title"]:
             raise ValueError("Введите заголовок.")
         return candidate

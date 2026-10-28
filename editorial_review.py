@@ -5,8 +5,9 @@ import hashlib
 from analyzer import ModelValidationError, ask, interval_iou
 from job_store import load_json, save_json, validate_interval
 from llm_context import INITIAL_PROMPT_BYTES, byte_size, sentence_json
+from interval_builder import make_interval
 
-REVIEW_VERSION = 4
+REVIEW_VERSION = 5
 SCHEMA = {"type": "object", "properties": {
     "decision": {"type": "string", "enum": ["keep", "revise", "reject"]},
     "start_id": {"type": "string"}, "end_id": {"type": "string"},
@@ -41,6 +42,8 @@ def review_report(raw_report_path, log, model=None):
         sentences = [s for s in transcript["sentences"]
                      if s["end"] >= candidate["start"] - 90 and s["start"] <= candidate["end"] + 90]
         allowed = {s["id"]: s for s in sentences}
+        interval_mode = raw.get("selection_method") == "intervals"
+        semantic_end = candidate.get("end_padding", {}).get("base_end", candidate["end"])
 
         def validate(value):
             if not isinstance(value, dict) or any(key not in value for key in SCHEMA["required"]):
@@ -62,7 +65,10 @@ def review_report(raw_report_path, log, model=None):
                 raise ValueError("Выбраны неизвестные ID предложений.")
             start, end = allowed[value["start_id"]]["start"], allowed[value["end_id"]]["end"]
             try:
-                validate_interval(start, end, transcript["duration_sec"], settings["min_duration_sec"], settings["max_duration_sec"])
+                if interval_mode:
+                    make_interval(allowed[value["start_id"]], allowed[value["end_id"]], transcript["duration_sec"], settings)
+                else:
+                    validate_interval(start, end, transcript["duration_sec"], settings["min_duration_sec"], settings["max_duration_sec"])
             except ValueError as exc:
                 feasible = [(s["id"], round(s["end"] - start, 2)) for s in sentences
                             if settings["min_duration_sec"] <= s["end"] - start <= settings["max_duration_sec"]]
@@ -77,8 +83,8 @@ def review_report(raw_report_path, log, model=None):
             validate(decision)
         else:
             before = [s for s in sentences if s["end"] <= candidate["start"]]
-            inside = [s for s in sentences if s["start"] >= candidate["start"] and s["end"] <= candidate["end"]]
-            after = [s for s in sentences if s["start"] >= candidate["end"]]
+            inside = [s for s in sentences if s["start"] >= candidate["start"] and s["end"] <= semantic_end]
+            after = [s for s in sentences if s["start"] >= semantic_end]
             instructions = ("Проверь чужую монтажную заявку СКЕПТИЧЕСКИ. Предыдущий редактор часто ошибается. "
                       "Не пересказывай его обоснование и не считай его оценку доказательством качества. "
                       "Проверь ВСЕ предложения выбранного интервала, а также контекст до/после. "
@@ -147,7 +153,10 @@ def review_report(raw_report_path, log, model=None):
                        start=allowed[decision["start_id"]]["start"], end=allowed[decision["end_id"]]["end"],
                        title=decision["title"], reason=decision["reason"], score=decision["score"], status="pending",
                        selection_score=candidate["score"], editorial_decision=decision["decision"],
-                       warnings=["Повторно проверено LLM. Требуется ваше утверждение по исходному видео."])
+                        warnings=["Повторно проверено LLM. Требуется ваше утверждение по исходному видео."])
+        if interval_mode:
+            revised.update(make_interval(allowed[decision["start_id"]], allowed[decision["end_id"]],
+                                         transcript["duration_sec"], settings))
         revised.pop("approval_key", None)
         kept.append(revised)
     ranked = []

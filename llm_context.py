@@ -39,6 +39,8 @@ def repair_feedback(prompt, reply, error, fallback):
         if isinstance(value, dict) and isinstance(value.get("clips"), list):
             value = {"clips": [{k: c[k] for k in ("start_id", "end_id", "score") if k in c}
                                if isinstance(c, dict) else c for c in value["clips"]]}
+        elif isinstance(value, dict) and "interval_id" in value:
+            value = {k: value[k] for k in ("interval_id", "score") if k in value}
         elif isinstance(value, dict) and "decision" in value:
             value = {k: value[k] for k in ("decision", "start_id", "end_id", "score") if k in value}
         reply = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -73,3 +75,22 @@ def fit_sentence_groups(sentences, build_prompt, overlap_seconds=30, budget=INIT
             next_first = first + max(1, (last - first) // 2)
         first = next_first
     return groups
+
+
+def fit_option_batches(options, build_prompt, budget=INITIAL_PROMPT_BYTES):
+    """Non-overlapping exhaustive batches; explicitly return indivisible oversized options."""
+    batches, oversized, current = [], [], []
+    for option in options:
+        if byte_size(build_prompt(current + [option])) <= budget:
+            current.append(option)
+            continue
+        if current:
+            batches.append(current)
+            current = []
+        if byte_size(build_prompt([option])) <= budget:
+            current = [option]
+        else:
+            oversized.append(option)
+    if current:
+        batches.append(current)
+    return batches, oversized

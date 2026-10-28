@@ -6,19 +6,9 @@ import math
 from pathlib import Path
 
 from analyzer import interval_iou
-from job_store import load_json, save_json, validate_interval
+from job_store import load_json, padding_seconds, save_json, validate_interval
 
 PADDING_VERSION = 1
-
-
-def padding_seconds(value):
-    try:
-        seconds = float(str(value).replace(",", "."))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Запас в конце укажите числом секунд от 0 до 5.") from exc
-    if not math.isfinite(seconds) or not 0 <= seconds <= 5:
-        raise ValueError("Запас в конце должен быть конечным числом от 0 до 5 секунд.")
-    return round(seconds, 3)
 
 
 def prepare_review_report(source_path, seconds, log):
@@ -56,6 +46,8 @@ def prepare_review_report(source_path, seconds, log):
         # JSON integers from floats (70 versus 70.0).
         if end != old_end:
             candidate["end"] = end
+        if "duration_sec" in candidate:
+            candidate["duration_sec"] = candidate["end"] - candidate["start"]
         candidate["end_padding"] = {"base_end": base_end, "padded_end": end, "requested_sec": seconds,
                                     "applied_sec": round(end - base_end, 6)}
         if end - base_end < seconds - 0.001:

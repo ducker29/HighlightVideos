@@ -40,6 +40,10 @@ def ask(settings, prompt, schema, validate, audit_path=None, previous_attempts=N
     attempts = list(previous_attempts or [])
     fallback = ("Если законченный клип нужной длины невозможен, верни clips=[]."
                 if "clips" in schema["properties"] else
+                "Выбери только предложенный interval_id; если подходящего нет, верни interval_id=none."
+                if "interval_id" in schema["properties"] else
+                "Выбери только разрешённый start_id; если хороших начал нет, верни starts=[]."
+                if "starts" in schema["properties"] else
                 "Если корректное исправление невозможно, верни decision=reject."
                 if "decision" in schema["properties"] else "Верни корректные метаданные по схеме.")
     if attempts:
@@ -236,10 +240,23 @@ def collect_clips(settings, prompt, sentences, duration, audit_path, log, label)
             "selection_warnings": warnings, "rejected_candidates": rejected}
 
 
-def analyze(job_dir, transcript, settings, log):
-    signature = hashlib.sha256(json.dumps({"transcript": transcript, "model": settings["llm_model"],
+def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
+    window_signature = hashlib.sha256(json.dumps({"transcript": transcript, "model": settings["llm_model"],
         "min": settings["min_duration_sec"], "max": settings["max_duration_sec"],
         "version": PROMPT_VERSION}, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
+    if selection_method not in ("intervals", "legacy"):
+        raise ValueError("Неизвестный метод отбора.")
+    window_cache = job_dir / "analysis" / window_signature
+    window_cache.mkdir(parents=True, exist_ok=True)
+    if selection_method == "intervals":
+        from interval_selector import SELECTION_VERSION
+        from job_store import padding_seconds
+        key = {"windows": window_signature, "selection_version": SELECTION_VERSION,
+               "padding": padding_seconds(settings.get("end_padding_sec", 0.5)),
+               "context": settings.get("llm_context_tokens", 32768), "context_policy": CONTEXT_POLICY_VERSION}
+        signature = "iv1_" + hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:20]
+    else:
+        signature = window_signature
     cache = job_dir / "analysis" / signature
     cache.mkdir(parents=True, exist_ok=True)
     report_path = cache / "report.json"
@@ -251,13 +268,15 @@ def analyze(job_dir, transcript, settings, log):
     # Old reviews must retain the exact transcript used for their analysis,
     # even if a later ASR run overwrites the job's current transcript.json.
     save_json(cache / "transcript.json", transcript)
+    if not (window_cache / "transcript.json").exists():
+        save_json(window_cache / "transcript.json", transcript)
 
     analyzed = []
     split_windows = False
     all_windows = windows(transcript["sentences"])
     for index, sentences in enumerate(all_windows):
         log(f"PASS 1: окно {index + 1}/{len(all_windows)}")
-        path = cache / f"window_{index:04d}.json"
+        path = window_cache / f"window_{index:04d}.json"
         if path.exists():
             analysis = load_json(path)
             analyzed.append({"sentences": sentences, "analysis": analysis})
@@ -271,7 +290,7 @@ def analyze(job_dir, transcript, settings, log):
             log(f"Окно {index + 1} разделено на {len(parts)} частей по бюджету запроса.")
         for part_index, part in enumerate(parts):
             part_key = hashlib.sha256(sentence_json(part).encode()).hexdigest()[:10]
-            part_path = path if len(parts) == 1 else cache / f"window_{index:04d}_part_{part_index:03d}_{part_key}.json"
+            part_path = path if len(parts) == 1 else window_cache / f"window_{index:04d}_part_{part_index:03d}_{part_key}.json"
 
             def validate_window(value):
                 if not isinstance(value, dict) or any(key not in value for key in WINDOW_SCHEMA["required"]):
@@ -305,6 +324,13 @@ def analyze(job_dir, transcript, settings, log):
     blocks = merge_windows(analyzed, maximum_span=max(900, settings["max_duration_sec"] + 300))
     for index, block in enumerate(blocks):
         log(f"PASS 2: тематический блок {index + 1}/{len(blocks)}")
+        if selection_method == "intervals":
+            from interval_selector import select_intervals
+            selection = select_intervals(block, transcript, settings, cache / f"block_{index:04d}", log)
+            analysis_warnings.extend(selection["warnings"])
+            analysis_complete = analysis_complete and selection["complete"]
+            candidates.extend(dict(candidate, block_id=index) for candidate in selection["candidates"])
+            continue
         all_unique = {s["id"]: s for window in block for s in window["sentences"]}
         all_sentences = sorted(all_unique.values(), key=lambda s: s["start"])
         prefix = f"block_budget_v{CONTEXT_POLICY_VERSION}" if split_windows else "block"
@@ -350,7 +376,8 @@ def analyze(job_dir, transcript, settings, log):
         candidate["candidate_id"] = f"c{index:03d}"
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
               "signature": signature, "candidates": ranked, "context_policy_version": CONTEXT_POLICY_VERSION,
-              "analysis_warnings": analysis_warnings, "analysis_complete": analysis_complete}
+              "analysis_warnings": analysis_warnings, "analysis_complete": analysis_complete,
+              "selection_method": selection_method, "window_cache": str(window_cache.resolve())}
     save_json(report_path, report)
     save_json(job_dir / "latest_report.json", {"path": str(report_path.resolve())})
     log(f"Найдено кандидатов: {len(ranked)}. Финальная нарезка ожидает вашего утверждения.")
