@@ -1,0 +1,11 @@
+{
+  "youtube_url": "https://www.youtube.com/watch?v=AVbz4UzkeTw",
+  "min_duration_sec": 120,
+  "max_duration_sec": 300,
+  "asr_model": "large-v3",
+  "device": "cuda",
+  "language": "ru",
+  "ollama_url": "http://localhost:11434",
+  "llm_model": "deepseek-r1:latest",
+  "editorial_model": "tom_himanen/deepseek-r1-roo-cline-tools:14b"
+}

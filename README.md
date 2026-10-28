@@ -1,5 +1,10 @@
 # 🎬 AI Clipping Agent
 
+> **Локальная адаптация для горизонтальных хайлайтов:** запуск `start_gui.bat`
+> или `.venv\Scripts\python.exe main.py`. Инструкция: [LOCAL_SETUP.md](LOCAL_SETUP.md).
+> Приложение использует Tkinter, смысловой отбор и обязательное утверждение перед нарезкой.
+> Ниже сохранено описание исходного Colab-проекта для вертикальных Shorts.
+
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Whisper](https://img.shields.io/badge/ASR-Faster--Whisper-orange)
