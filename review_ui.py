@@ -13,7 +13,7 @@ from analyzer import list_models
 from app_backend import open_report, run_analysis
 from job_store import DATA, ROOT, analysis_bounds, load_json, parse_time, save_json, timecode, validate_interval
 from renderer import approval_key, output_filename, render_approved
-from clip_padding import padding_seconds, prepare_review_report
+from clip_padding import padding_seconds, prepare_review_report, refresh_padding_overlaps, set_candidate_padding
 from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
 
@@ -122,10 +122,10 @@ class HighlightApp:
         panes = ttk.Panedwindow(outer, orient="vertical")
         panes.pack(fill="both", expand=True)
         table_frame = ttk.Frame(panes)
-        columns = ("candidate_id", "status", "start", "end", "duration", "score", "title")
+        columns = ("candidate_id", "status", "start", "end", "duration", "score", "title", "padding", "render")
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=9, selectmode="browse")
-        for key, label, width in zip(columns, ("ID", "Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок"),
-                                     (75, 120, 115, 115, 85, 70, 405)):
+        for key, label, width in zip(columns, ("ID", "Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок", "Запас", "Нарезка"),
+                                     (65, 110, 100, 100, 75, 60, 270, 65, 95)):
             self.table.heading(key, text=label)
             self.table.column(key, width=width, stretch=(key == "title"))
         scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
@@ -133,6 +133,7 @@ class HighlightApp:
         self.table.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.table.bind("<<TreeviewSelect>>", lambda event: self.show_candidate())
+        self.table.bind("<Button-1>", self.table_action)
         panes.add(table_frame, weight=2)
 
         review = ttk.LabelFrame(panes, text="Ревью выбранного кандидата", padding=6)
@@ -371,12 +372,58 @@ class HighlightApp:
             return None
         return next((c for c in self.context["report"]["candidates"] if c["candidate_id"] == selected[0]), None)
 
+    def table_action(self, event):
+        row = self.table.identify_row(event.y)
+        column = self.table.identify_column(event.x)
+        if not row or column not in ("#8", "#9"):
+            return
+        if self.busy:
+            return "break"
+        if self.has_unsaved_edits():
+            messagebox.showinfo("Ревью", "Сначала сохраните правки выбранного кандидата.", parent=self.root)
+            return "break"
+        self.table.selection_set(row)
+        self.show_candidate()
+        if column == "#8":
+            self.toggle_candidate_padding()
+        else:
+            self.render(row)
+        return "break"
+
+    def toggle_candidate_padding(self):
+        if self.busy or not self.context:
+            return
+        if self.has_unsaved_edits():
+            messagebox.showinfo("Ревью", "Сначала сохраните правки выбранного кандидата.", parent=self.root)
+            return
+        current = self.current_candidate()
+        if not current:
+            return
+        try:
+            candidate = set_candidate_padding(
+                current, not current.get("end_padding_enabled", True),
+                self.variables["end_padding_sec"].get(),
+                self.context["manifest"]["media"]["duration_sec"], self.context["report"]["settings"])
+            updated = copy.deepcopy(self.context["report"])
+            updated["candidates"] = [candidate if c["candidate_id"] == candidate["candidate_id"] else c
+                                     for c in updated["candidates"]]
+            refresh_padding_overlaps(updated)
+            save_json(self.context["report_path"], updated)
+            self.context["report"] = updated
+            self.refresh_table(candidate["candidate_id"])
+            self.show_candidate()
+            if current["status"] == "approved" and candidate["status"] != "approved":
+                self.status.set("Границы изменены. Утвердите клип заново перед нарезкой.")
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Запас в конце", str(exc), parent=self.root)
+
     def refresh_table(self, selected=None):
         self.table.delete(*self.table.get_children())
         for candidate in self.context["report"]["candidates"]:
             self.table.insert("", "end", iid=candidate["candidate_id"], values=(
                 candidate["candidate_id"], STATUS.get(candidate["status"], candidate["status"]), timecode(candidate["start"]), timecode(candidate["end"]),
-                round(candidate["end"] - candidate["start"], 2), candidate["score"], candidate["title"]))
+                round(candidate["end"] - candidate["start"], 2), candidate["score"], candidate["title"],
+                "☑" if candidate.get("end_padding_enabled", True) else "☐", "▶ Нарезать"))
         children = self.table.get_children()
         if children:
             self.table.selection_set(selected if selected in children else children[0])
@@ -434,7 +481,9 @@ class HighlightApp:
         if padding and abs(candidate["end"] - padding["padded_end"]) < 0.000001:
             semantic_end = padding["base_end"]
             padding_text = (f"Конец до запаса: {timecode(semantic_end)}; "
-                            f"добавлен запас {padding['applied_sec']:g} с (запрошен {padding['requested_sec']:g} с).\n")
+                             f"добавлен запас {padding['applied_sec']:g} с (запрошен {padding['requested_sec']:g} с).\n")
+            if not candidate.get("end_padding_enabled", True):
+                padding_text = "Запас для этого клипа отключён.\n"
         elif padding:
             padding_text = "Конец изменён вручную; автоматический запас повторно не добавляется.\n"
         else:
@@ -498,7 +547,9 @@ class HighlightApp:
         return (self.start.get() != timecode(candidate["start"]) or self.end.get() != timecode(candidate["end"])
                 or self.title.get().strip() != candidate["title"])
 
-    def render(self):
+    def render(self, candidate_id=None):
+        if self.busy:
+            return
         if not self.context:
             messagebox.showinfo("Нарезка", "Сначала получите или откройте отчёт кандидатов.", parent=self.root)
             return
@@ -506,9 +557,12 @@ class HighlightApp:
             messagebox.showinfo("Ревью", "Сохраните и при необходимости утвердите правки выбранного кандидата.", parent=self.root)
             return
         report = copy.deepcopy(self.context["report"])
+        if candidate_id is not None:
+            report["candidates"] = [c for c in report["candidates"] if c["candidate_id"] == candidate_id]
         approved = [c for c in report["candidates"] if c["status"] == "approved"]
         if not approved:
-            messagebox.showinfo("Нарезка", "Сначала утвердите хотя бы один интервал.", parent=self.root)
+            messagebox.showinfo("Нарезка", "Сначала утвердите этот интервал." if candidate_id is not None
+                                else "Сначала утвердите хотя бы один интервал.", parent=self.root)
             return
         output_dir = Path(self.context["job_dir"]) / "output" / report["signature"]
         intervals = "\n".join(f"{c['candidate_id']}: {timecode(c['start'])} — {timecode(c['end'])}\n"
