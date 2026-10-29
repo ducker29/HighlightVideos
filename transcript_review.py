@@ -50,7 +50,7 @@ def review_sections(transcript, start, end, context_count=3):
     return {"start": start, "end": end, "before": before, "rows": rows, "after": after}
 
 
-def transcript_chunks(sections):
+def transcript_chunks(sections, include_technical=True):
     """Return tagged text chunks: context/full/partial/marker, for both GUI and tests."""
     start, end = sections["start"], sections["end"]
     result = [("context", "КОНТЕКСТ ДО — НЕ ВХОДИТ ЦЕЛИКОМ В КЛИП\n")]
@@ -66,7 +66,8 @@ def transcript_chunks(sections):
     else:
         result.append(("context", "(Предыдущих реплик в сохранённом транскрипте нет.)\n"))
     result.append(("marker", f"\n{START_MARKER}\n"))
-    result.append(("clip", f"Границы исходного видео: {timecode(start)}–{timecode(end)}. Разметка ASR приблизительная.\n"))
+    if include_technical:
+        result.append(("clip", f"Границы исходного видео: {timecode(start)}–{timecode(end)}. Разметка ASR приблизительная.\n"))
     if not sections["rows"]:
         result.append(("clip", "(В этом интервале нет распознанных реплик.)\n"))
     for row in sections["rows"]:
@@ -78,7 +79,8 @@ def transcript_chunks(sections):
             if row["cut_words"]:
                 details += " Граница проходит внутри слов: «" + "», «".join(row["cut_words"]) + "»."
             if not row["word_timestamps_available"]:
-                details = "(Нет word-level разметки для точного отображения этой части.)"
+                details = ("(Нет word-level разметки для точного отображения этой части.)" if include_technical
+                           else "(Точный текст этой части реплики недоступен.)")
             result.append(("partial", prefix + "[НЕПОЛНАЯ РЕПЛИКА] " + details +
                            " Полный текст показан отдельно в контексте.\n"))
     result.append(("marker", f"{END_MARKER}\n\n"))

@@ -667,6 +667,10 @@ class RenderIntegrationTests(unittest.TestCase):
             report_path = job / "analysis" / "test" / "report.json"
             save_json(report_path, report)
             save_json(report_path.parent / "transcript.json", {"duration_sec": manifest["media"]["duration_sec"]})
+            save_json(job / "transcript.json", {"sentences": [
+                {"start": 0, "end": 0.5, "text": "Контекст до."},
+                {"start": 1, "end": 3, "text": "Реплика клипа."},
+                {"start": 4.5, "end": 5, "text": "Контекст после."}]})
             report = load_json(prepare_review_report(report_path, 0.5, lambda message: None))
             clip = report["candidates"][0]
             self.assertAlmostEqual(clip["end"], 4.3)
@@ -686,6 +690,13 @@ class RenderIntegrationTests(unittest.TestCase):
             self.assertEqual(media["frame_rate"], manifest["media"]["frame_rate"])
             self.assertAlmostEqual(media["duration_sec"], 3.5, delta=0.15)
             self.assertTrue(Path(outputs[0]).with_suffix(".json").exists())
+            text_path = Path(outputs[0]).with_suffix(".txt")
+            text = text_path.read_text(encoding="utf-8")
+            self.assertIn(clip["title"], text)
+            self.assertIn("Почему выбран:", text)
+            for phrase in ("Контекст до.", "Реплика клипа.", "Контекст после.", "[00:00:01.000–00:00:03.000]"):
+                self.assertIn(phrase, text)
+            self.assertNotIn("ASR", text)
             self.assertEqual(load_json(Path(outputs[0]).with_suffix(".json"))["approved_candidate"]["candidate_id"], "c001")
             original_bytes = Path(outputs[0]).read_bytes()
             original_metadata = Path(outputs[0]).with_suffix(".json").read_bytes()
@@ -695,6 +706,8 @@ class RenderIntegrationTests(unittest.TestCase):
             self.assertEqual(Path(repeated[0]).name, next_name)
             self.assertEqual(Path(outputs[0]).read_bytes(), original_bytes)
             self.assertEqual(Path(outputs[0]).with_suffix(".json").read_bytes(), original_metadata)
+            self.assertEqual(text_path.read_text(encoding="utf-8"), text)
+            self.assertEqual(Path(repeated[0]).with_suffix(".txt").read_text(encoding="utf-8"), text)
 
 
 if __name__ == "__main__":

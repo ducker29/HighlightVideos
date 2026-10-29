@@ -6,7 +6,8 @@ import subprocess
 from pathlib import Path
 
 from downloader import probe
-from job_store import save_json, validate_interval
+from job_store import load_json, save_json, validate_interval
+from transcript_review import review_sections, transcript_chunks
 
 
 def approval_key(candidate):
@@ -42,12 +43,19 @@ def output_filename(candidate, output_dir=None):
             raise ValueError("Слишком длинный путь папки экспорта. Выберите более короткую папку проекта.")
         stem = f"{identifier}_{_shorten(title, title_units) or '_'}{suffix}"
         if output_dir is None or not any((output_dir / (stem + extension)).exists()
-                                         for extension in (".mp4", ".json", ".ffmpeg.log", ".partial.mp4", ".json.tmp")):
+                                         for extension in (".mp4", ".txt", ".json", ".ffmpeg.log", ".partial.mp4", ".json.tmp")):
             return stem + ".mp4"
         index += 1
 
 
-def render_approved(manifest, report, job_dir, log):
+def clip_text(clip, transcript):
+    sections = review_sections(transcript, clip["start"], clip["end"])
+    return (f"Название клипа: {clip.get('title') or 'Без названия'}\n\n"
+            f"Почему выбран: {clip.get('reason') or 'Не указано.'}\n\n"
+            + "".join(text for _, text in transcript_chunks(sections, include_technical=False)))
+
+
+def render_approved(manifest, report, job_dir, log, transcript=None):
     clips = [c for c in report["candidates"] if c["status"] == "approved"]
     if not clips:
         raise ValueError("Нет утверждённых клипов.")
@@ -57,10 +65,13 @@ def render_approved(manifest, report, job_dir, log):
                           report["settings"]["min_duration_sec"], report["settings"]["max_duration_sec"])
         if clip.get("approval_key") != approval_key(clip):
             raise ValueError(f"Границы {clip['candidate_id']} изменились после утверждения. Утвердите их заново.")
+    if transcript is None:
+        transcript = load_json(Path(job_dir) / "transcript.json")
+    texts = [clip_text(clip, transcript) for clip in clips]
     output_dir = Path(job_dir) / "output" / report["signature"]
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs = []
-    for clip in clips:
+    for clip, text in zip(clips, texts):
         log(f"Рендер {clip['candidate_id']}: {clip['title']}")
         target = output_dir / output_filename(clip, output_dir)
         temporary = target.with_suffix(".partial.mp4")
@@ -82,6 +93,7 @@ def render_approved(manifest, report, job_dir, log):
         temporary.rename(target)
         save_json(target.with_suffix(".json"), {"source": manifest, "approved_candidate": clip,
                                                "output": str(target), "media": rendered})
+        target.with_suffix(".txt").write_text(text, encoding="utf-8")
         outputs.append(str(target))
         log(f"Сохранено: {target}")
     return outputs

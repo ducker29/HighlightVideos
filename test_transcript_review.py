@@ -7,7 +7,7 @@ import tkinter as tk
 import unittest
 
 from job_store import load_json, save_json
-from renderer import approval_key
+from renderer import approval_key, clip_text, output_filename
 from review_ui import HighlightApp
 from transcript_review import END_MARKER, START_MARKER, review_sections, transcript_chunks
 
@@ -25,6 +25,25 @@ def sentence(i):
 
 
 class TranscriptReviewTests(unittest.TestCase):
+    def test_export_matches_dialogue_view_without_technical_data(self):
+        transcript = {"sentences": [sentence(i) for i in range(12)]}
+        clip = {"candidate_id": "c001", "title": "Название", "reason": "Законченная мысль",
+                "start": 40, "end": 70, "approval_key": "secret"}
+        text = clip_text(clip, transcript)
+        expected = text_of(review_sections(transcript, 40, 70))
+        technical = "Границы исходного видео: 00:00:40.000–00:01:10.000. Разметка ASR приблизительная.\n"
+        self.assertEqual(text, "Название клипа: Название\n\nПочему выбран: Законченная мысль\n\n"
+                         + expected.replace(technical, ""))
+        self.assertNotIn("secret", text)
+        clip["start"] = 45
+        partial = clip_text(clip, transcript)
+        self.assertIn("НЕПОЛНАЯ РЕПЛИКА", partial)
+        self.assertNotIn("word-level", partial)
+        with tempfile.TemporaryDirectory() as directory:
+            name = output_filename(clip, directory)
+            Path(directory, name).with_suffix(".txt").write_text("Старый текст", encoding="utf-8")
+            self.assertNotEqual(output_filename(clip, directory), name)
+
     def test_three_before_and_after_are_outside_markers(self):
         transcript = {"sentences": [sentence(i) for i in range(12)]}
         original = copy.deepcopy(transcript)

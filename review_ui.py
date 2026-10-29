@@ -573,8 +573,9 @@ class HighlightApp:
             return
         manifest = copy.deepcopy(self.context["manifest"])
         job_dir = self.context["job_dir"]
+        transcript = copy.deepcopy(self.context["transcript"])
         self.start_worker("Финальная нарезка утверждённых интервалов…",
-                          lambda: render_approved(manifest, report, job_dir, self.log))
+                          lambda: render_approved(manifest, report, job_dir, self.log, transcript=transcript))
 
     def preview(self):
         try:
