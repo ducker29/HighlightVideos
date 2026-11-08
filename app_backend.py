@@ -7,6 +7,7 @@ from job_store import analysis_bounds, load_json, save_json, timecode
 from transcriber import check_runtime, transcribe
 from editorial_review import review_report
 from clip_padding import padding_seconds, prepare_review_report
+from job_store import migrate_report
 
 
 def release_llm_for_asr(settings, log):
@@ -60,6 +61,8 @@ def open_report(path):
     report = load_json(path)
     if report.get("schema") != 1 or "candidates" not in report:
         raise ValueError("Это не отчёт кандидатов Highlight Pipeline.")
+    # Старым отчётам дополняем профили и поле формата, не трогая утверждения и границы.
+    migrate_report(report)
     # Reports live at data/<video_id>/analysis/<signature>/report.json.
     job_dir = path.parent.parent.parent
     manifest = load_json(job_dir / "source.json")

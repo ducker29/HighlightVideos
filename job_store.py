@@ -81,3 +81,138 @@ def parse_time(value):
     for part in parts:
         result = result * 60 + float(part)
     return result
+
+
+# --- Профили выхода (16:9 хайлайты / 9:16 Shorts) -------------------------
+
+PROFILE_NAMES = ("highlights", "shorts")
+
+DEFAULT_PROFILE = {
+    "aspect_ratio": "16:9",
+    "min_duration_sec": 120,
+    "max_duration_sec": 300,
+    "end_padding_sec": 0.5,
+}
+
+SHORTS_PROFILE = {
+    "enabled": False,
+    "aspect_ratio": "9:16",
+    "min_duration_sec": 20,
+    "target_duration_sec": 40,
+    "max_duration_sec": 60,
+    "crop_mode": "center",
+    "subtitles_enabled": True,
+    "max_candidates": 30,
+    "final_candidates": 10,
+}
+
+FORMATS = ("highlight", "short")
+
+
+def normalize_profiles(raw):
+    """Объединяет секцию ``outputs`` с дефолтами; отсутствие секции = старый режим 16:9 + shorts выключены."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("Секция profiles должна быть объектом с полями highlights и shorts.")
+    profiles = {}
+    highlights = dict(DEFAULT_PROFILE)
+    if "highlights" in raw:
+        highlights.update(raw["highlights"])
+    highlights["min_duration_sec"] = int(highlights["min_duration_sec"])
+    highlights["max_duration_sec"] = int(highlights["max_duration_sec"])
+    highlights["end_padding_sec"] = float(highlights["end_padding_sec"])
+    if not 1 <= highlights["min_duration_sec"] <= highlights["max_duration_sec"] <= 480:
+        raise ValueError("Профиль highlights: нужна длительность 1 ≤ минимум ≤ максимум ≤ 480 секунд.")
+    if highlights["aspect_ratio"] not in ("16:9", "9:16"):
+        raise ValueError("Недопустимое aspect_ratio профиля highlights.")
+    profiles["highlights"] = highlights
+    shorts = dict(SHORTS_PROFILE)
+    if "shorts" in raw:
+        shorts.update(raw["shorts"])
+    shorts["enabled"] = bool(shorts["enabled"])
+    shorts["min_duration_sec"] = int(shorts["min_duration_sec"])
+    shorts["target_duration_sec"] = int(shorts["target_duration_sec"])
+    shorts["max_duration_sec"] = int(shorts["max_duration_sec"])
+    shorts["max_candidates"] = int(shorts["max_candidates"])
+    shorts["final_candidates"] = int(shorts["final_candidates"])
+    if shorts["subtitles_enabled"] is not True:
+        shorts["subtitles_enabled"] = bool(shorts["subtitles_enabled"])
+    if not 1 <= shorts["min_duration_sec"] <= shorts["max_duration_sec"]:
+        raise ValueError("Профиль shorts: минимум должен быть не больше максимума.")
+    if not shorts["min_duration_sec"] <= shorts["target_duration_sec"] <= shorts["max_duration_sec"]:
+        raise ValueError("Профиль shorts: target должен находиться между минимумом и максимумом.")
+    if shorts["aspect_ratio"] not in ("9:16",):
+        raise ValueError("Профиль shorts должен иметь aspect_ratio 9:16.")
+    if shorts["crop_mode"] not in ("center", "speaker", "auto"):
+        raise ValueError("Недопустимый crop_mode профиля shorts.")
+    profiles["shorts"] = shorts
+    return profiles
+
+
+def profile_settings(settings):
+    """Плоские настройки → структура профилей (обратная совместимость)."""
+    return normalize_profiles(settings.get("outputs"))
+
+
+def report_profiles(report):
+    """Профили из отчёта (поле ``profiles`` или настройки запуска анализа)."""
+    if isinstance(report.get("profiles"), dict):
+        return report["profiles"]
+    return normalize_profiles((report.get("settings") or {}).get("outputs"))
+
+
+def candidate_format(candidate):
+    """Отсутствует / ``highlight`` → длинный хайлайт; ``short`` → Shorts."""
+    value = candidate.get("format")
+    if value is None:
+        return "highlight"
+    if value not in FORMATS:
+        raise ValueError(f"Недопустимый формат кандидата: {value!r}.")
+    return value
+
+
+def profile_for_format(profiles, fmt):
+    """Профиль по формату: хайлайты всегда, shorts только при включении."""
+    fmt = candidate_format({"format": fmt})
+    if fmt == "short":
+        shorts = profiles["shorts"]
+        if not shorts.get("enabled"):
+            raise ValueError("Shorts отключены в настройках профиля (outputs.shorts.enabled=false).")
+        return shorts
+    return profiles["highlights"]
+
+
+def validate_candidate_format(profiles, candidate):
+    """Проверяет согласованность ID, формата и ограничений длительности профиля."""
+    fmt = candidate_format(candidate)
+    profile = profile_for_format(profiles, fmt)
+    expected = "s" if fmt == "short" else "c"
+    cid = candidate.get("candidate_id", "")
+    if not cid.startswith(expected):
+        raise ValueError(
+            f"Кандидат {cid!r}: префикс ID должен быть '{expected}' для формата '{fmt}'.")
+    start, end = float(candidate["start"]), float(candidate["end"])
+    duration = candidate.get("duration_sec")
+    if duration is not None:
+        validate_interval(start, end, duration, profile["min_duration_sec"], profile["max_duration_sec"])
+    else:
+        if not 0 <= start < end:
+            raise ValueError("Нужны границы 0 ≤ начало < конец.")
+        if end - start < profile["min_duration_sec"] - 0.001:
+            raise ValueError(f"Клип короче минимальной длительности {profile['min_duration_sec']} с.")
+        if end - start > profile["max_duration_sec"] + 0.001:
+            raise ValueError(f"Клип длиннее максимальной длительности {profile['max_duration_sec']} с.")
+    return fmt
+
+
+def migrate_report(report):
+    """Дополняет старый отчёт полями формата, не трогая утверждения и границы."""
+    if not isinstance(report, dict):
+        raise ValueError("Отчёт должен быть объектом.")
+    profiles = normalize_profiles((report.get("settings") or {}).get("outputs"))
+    report["profiles"] = profiles
+    for candidate in report.get("candidates", []):
+        if "format" not in candidate:
+            candidate["format"] = "highlight"
+    return report

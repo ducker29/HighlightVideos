@@ -12,7 +12,29 @@ from transcript_review import review_sections, transcript_chunks
 
 def approval_key(candidate):
     return hashlib.sha256(json.dumps({k: candidate[k] for k in ("candidate_id", "start", "end")},
-                                    sort_keys=True).encode()).hexdigest()
+                                     sort_keys=True).encode()).hexdigest()
+
+
+def shorts_approval_key(candidate):
+    """Отдельная сигнатура утверждения Shorts: учитывает всё, что меняет итоговый MP4.
+
+    Изменение любого полей ниже снимает утверждение Short. Заголовок намеренно не входит.
+    """
+    render = candidate.get("render_settings") or {}
+    payload = {
+        "candidate_id": candidate["candidate_id"],
+        "start": candidate["start"],
+        "end": candidate["end"],
+        "format": candidate.get("format", "short"),
+        "crop_mode": render.get("crop_mode", "center"),
+        "crop_x": render.get("crop_x"),
+        "subtitles_enabled": render.get("subtitles_enabled", True),
+        "output_width": render.get("output_width", 1080),
+        "output_height": render.get("output_height", 1920),
+        "end_padding": candidate.get("end_padding"),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                     allow_nan=False).encode("utf-8")).hexdigest()
 
 
 def _filename_part(value, fallback):

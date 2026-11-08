@@ -364,6 +364,7 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
                 validate_clip(clip, unique, transcript["duration_sec"], settings)
                 start, end = unique[clip["start_id"]]["start"], unique[clip["end_id"]]["end"]
                 candidates.append({**clip, "start": start, "end": end, "status": "pending",
+                                   "format": "highlight",
                                    "warnings": ["Проверьте завершённость мысли по исходной записи."],
                                    "block_id": index})
     ranked = []
@@ -374,7 +375,9 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
             break
     for index, candidate in enumerate(ranked, 1):
         candidate["candidate_id"] = f"c{index:03d}"
+    from job_store import normalize_profiles
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
+              "profiles": normalize_profiles(settings.get("outputs")),
               "signature": signature, "candidates": ranked, "context_policy_version": CONTEXT_POLICY_VERSION,
               "analysis_warnings": analysis_warnings, "analysis_complete": analysis_complete,
               "selection_method": selection_method, "window_cache": str(window_cache.resolve())}
