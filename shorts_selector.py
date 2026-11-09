@@ -7,10 +7,11 @@ never invent timestamps.
 """
 import hashlib
 import json
+from pathlib import Path
 
 from analyzer import ModelValidationError, ask, interval_iou
 from interval_builder import build_interval_options
-from job_store import load_json, normalize_profiles, profile_for_format, save_json, validate_interval
+from job_store import normalize_profiles, profile_for_format, save_json, validate_interval
 from llm_context import INITIAL_PROMPT_BYTES, fit_option_batches, sentence_json
 
 SHORTS_SELECTION_VERSION = 1
@@ -24,6 +25,64 @@ START_PROMPT_TEMPLATE = ("Выбери до трёх сильных НАЧАЛ �
                          "Тема блока: {topic}\n"
                          "Кандидаты на начало (id, sec, text): {start_rows}\n"
                          "Полный текст блока: {sentences}")
+
+
+def shorts_cache_signature(settings):
+    """Вычисляет отдельную сигнатуру для кеша Shorts, зависящую только от настроек Shorts.
+
+    В отличие от window_signature (который включает настройки Highlights),
+    эта сигнатура меняется при изменении только настроек Shorts.
+    """
+    profiles = normalize_profiles(settings.get("outputs"))
+    try:
+        profile = profile_for_format(profiles, "short")
+    except ValueError:
+        return None
+    key = {
+        "min": profile["min_duration_sec"],
+        "max": profile["max_duration_sec"],
+        "target": profile.get("target_duration_sec"),
+        "padding": profile.get("end_padding_sec", 0.5),
+        "version": SHORTS_SELECTION_VERSION,
+    }
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def shorts_full_key(window_signature, settings):
+    """Формирует итоговый ключ кеша Shorts из базовой сигнатуры анализа и настроек Shorts.
+
+    Итоговый ключ гарантирует, что кеш не будет переиспользован при изменении:
+    - транскрипта, модели или диапазона анализа (через window_signature);
+    - настроек Shorts (через shorts_cache_signature).
+
+    Изменение только настроек Shorts не влияет на window_signature (Highlights).
+    """
+    shorts_sig = shorts_cache_signature(settings)
+    if shorts_sig is None:
+        return None
+    combined = f"{window_signature}_{shorts_sig}"
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_json_lenient(path):
+    """Читает кеш Shorts: возвращает None при повреждённом JSON, чтобы пересоздать артефакт.
+
+    Локальная защита от частичной записи / битых файлов: повреждённый артефакт игнорируется
+    и пересоздаётся обычным путём. Ошибки LLM и ошибки записи не скрываются — они не
+    возникают здесь.
+    """
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _is_catalog_ok(catalog):
+    """Проверяет, что кеш-каталог структурно корректен."""
+    return (isinstance(catalog, dict)
+            and isinstance(catalog.get("options"), list)
+            and isinstance(catalog.get("sentence_ids"), list)
+            and all(isinstance(o, dict) and "interval_id" in o for o in catalog["options"]))
 
 
 def _shorts_profile(settings):
@@ -53,15 +112,15 @@ def choice_schema(ids):
 
 def _build_shorts_catalog(sentences, duration, profile, cache_dir):
     catalog_path = cache_dir / "catalog.json"
-    if catalog_path.exists():
-        return load_json(catalog_path)
-    profile_settings = {"min_duration_sec": profile["min_duration_sec"],
-                        "max_duration_sec": profile["max_duration_sec"],
-                        "end_padding_sec": profile.get("end_padding_sec", 0.5)}
-    options = build_interval_options(sentences, sentences[0]["id"], duration, profile_settings)
-    catalog = {"options": options, "profile": profile_settings,
-               "sentence_ids": [s["id"] for s in sentences]}
-    save_json(catalog_path, catalog)
+    catalog = _read_json_lenient(catalog_path)
+    if not _is_catalog_ok(catalog):
+        profile_settings = {"min_duration_sec": profile["min_duration_sec"],
+                            "max_duration_sec": profile["max_duration_sec"],
+                            "end_padding_sec": profile.get("end_padding_sec", 0.5)}
+        options = build_interval_options(sentences, sentences[0]["id"], duration, profile_settings)
+        catalog = {"options": options, "profile": profile_settings,
+                   "sentence_ids": [s["id"] for s in sentences]}
+        save_json(catalog_path, catalog)
     return catalog
 
 
@@ -105,9 +164,13 @@ def select_shorts(block, transcript, settings, cache_dir, log):
 
     # --- PASS 2A-Shorts: pick up to 3 strong start sentences ---
     starts_path = cache_dir / "starts.json"
-    if starts_path.exists():
-        starts = load_json(starts_path)
-    else:
+    starts = None
+    cached = _read_json_lenient(starts_path)
+    if (isinstance(cached, list) and cached
+            and all(isinstance(entry, dict) and entry.get("start_id") in unique_starts
+                    for entry in cached)):
+        starts = cached
+    if starts is None:
         prompt = START_PROMPT_TEMPLATE.format(
             topic=topic,
             start_rows=json.dumps([{"id": s["id"], "sec": s["start"], "text": s["text"][:90]}
@@ -186,8 +249,9 @@ def select_shorts(block, transcript, settings, cache_dir, log):
                 json.dumps([o["interval_id"] for o in batch], sort_keys=True).encode()
             ).hexdigest()[:12]
             batch_path = cache_dir / f"end_{batch_key}.json"
-            if batch_path.exists():
-                choice = load_json(batch_path)
+            cached = _read_json_lenient(batch_path)
+            choice = cached if isinstance(cached, dict) else None
+            if choice is not None:
                 if choice.get("validation_failed"):
                     no_match += 1
                     continue

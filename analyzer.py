@@ -387,23 +387,25 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
     shorts_candidates = []
     shorts_enabled = normalize_profiles(settings.get("outputs")).get("shorts", {}).get("enabled", True)
     if shorts_enabled:
-        from shorts_selector import select_shorts
-        for index, block in enumerate(blocks):
-            log(f"PASS-Shorts: блок {index + 1}/{len(blocks)}")
-            try:
-                shorts_selection = select_shorts(
-                    block, transcript, settings,
-                    job_dir / "analysis" / f"shorts_{window_signature}" / f"block_{index:04d}",
-                    log)
-                analysis_warnings.extend(shorts_selection["warnings"])
-                analysis_complete = analysis_complete and shorts_selection["complete"]
-                shorts_candidates.extend(
-                    dict(candidate, block_id=index) for candidate in shorts_selection["candidates"])
-            except Exception as exc:
-                warning = f"PASS-Shorts, блок {index + 1}: {exc}"
-                log(warning)
-                analysis_warnings.append(warning)
-                analysis_complete = False
+        from shorts_selector import select_shorts, shorts_full_key
+        shorts_key = shorts_full_key(window_signature, settings)
+        if shorts_key:
+            for index, block in enumerate(blocks):
+                log(f"PASS-Shorts: блок {index + 1}/{len(blocks)}")
+                try:
+                    shorts_selection = select_shorts(
+                        block, transcript, settings,
+                        job_dir / "analysis" / f"shorts_{shorts_key}" / f"block_{index:04d}",
+                        log)
+                    analysis_warnings.extend(shorts_selection["warnings"])
+                    analysis_complete = analysis_complete and shorts_selection["complete"]
+                    shorts_candidates.extend(
+                        dict(candidate, block_id=index) for candidate in shorts_selection["candidates"])
+                except Exception as exc:
+                    warning = f"PASS-Shorts, блок {index + 1}: {exc}"
+                    log(warning)
+                    analysis_warnings.append(warning)
+                    analysis_complete = False
         if shorts_candidates:
             log(f"PASS-Shorts: найдено {len(shorts_candidates)} кандидатов на Shorts.")
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
