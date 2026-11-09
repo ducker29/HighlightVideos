@@ -408,6 +408,12 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
               "analysis_warnings": analysis_warnings, "analysis_complete": analysis_complete,
               "selection_method": selection_method, "window_cache": str(window_cache.resolve())}
     save_json(report_path, report)
+
+    # --- Independent Shorts editorial review ---
+    if shorts_enabled and shorts_candidates:
+        from shorts_editorial import review_shorts_candidates
+        review_shorts_candidates(report_path, log)
+
     save_json(job_dir / "latest_report.json", {"path": str(report_path.resolve())})
     log(f"Найдено кандидатов: {len(ranked)}. Финальная нарезка ожидает вашего утверждения.")
     return report_path
