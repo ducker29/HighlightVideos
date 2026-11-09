@@ -2,8 +2,11 @@
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from downloader import probe
@@ -130,6 +133,23 @@ SUBTITLE_SAFE_BOTTOM = 240
 SUBTITLE_SAFE_SIDE = 60
 SUBTITLE_MAX_CHARS_PER_LINE = 36
 SUBTITLE_MAX_WORDS_PER_CUE = 6
+
+
+def _filtergraph_escape_path(path):
+    """Экранирует Windows-путь для вставки в аргумент фильтра subtitles.
+
+    Фильтр subtitles в filtergraph использует собственные правила экранирования:
+    уровень 0 (значение аргумента фильтра) экранирует \\, ', :, ;, [, ], и пробел
+    обратным слешем. Двоеточие после буквы диска (D:) обязано остаться
+    экранированным как D\:, иначе FFmpeg потеряет его.
+
+    Кавычки в filtergraph не используются — весь путь передаётся внутри
+    одиночных кавычек Python-строки vf, поэтому двойное экранирование не нужно.
+    """
+    result = str(path).replace("\\", "/")
+    for ch in ("\\", "'", ":", ";", "[", "]"):
+        result = result.replace(ch, "\\" + ch)
+    return result
 
 
 def _crop_params(source_width, source_height, crop_x=None):
@@ -284,17 +304,24 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
             f"crop={crop_w}:{crop_h}:{cx}:{cy}",
             f"scale={SHORTS_OUTPUT_W}:{SHORTS_OUTPUT_H}",
         ]
-        srt_input_path = None
+        srt_keep_path = None
+        tmp_srt_path = None
         if subtitles_on:
             srt_content = build_subtitles_srt(transcript, clip["start"], clip["end"])
             if srt_content:
-                srt_path = output_dir / (target.stem + ".srt")
-                srt_path.write_text(srt_content, encoding="utf-8-sig")
-                srt_input_path = srt_path
-                # Экранируем путь для filtergraph: обратный сепаратор и двоеточие
-                safe_name = str(srt_path).replace("\\", "/").replace(":", "/")
+                srt_keep_path = output_dir / (target.stem + ".srt")
+                srt_keep_path.write_text(srt_content, encoding="utf-8-sig")
+                if not srt_keep_path.exists() or not srt_keep_path.stat().st_size:
+                    raise RuntimeError(f"SRT не создан или пуст: {srt_keep_path}")
+                # Временный SRT с коротким ASCII-именем в том же каталоге,
+                # чтобы FFmpeg subtitles-фильтр точно находил файл.
+                fd, tmp_srt_path = tempfile.mkstemp(
+                    prefix="subs_", suffix=".srt", dir=str(output_dir), text=True)
+                with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+                    f.write(srt_content)
+                escaped = _filtergraph_escape_path(tmp_srt_path)
                 vf_parts.append(
-                    f"subtitles='{safe_name}':force_style='FontName=Arial,FontSize=18,"
+                    f"subtitles='{escaped}':force_style='FontName=Arial,FontSize=18,"
                     f"PrimaryColour=&HFFFFFF&,OutlineColour=&H00000000&,Outline=1,Alignment=2,"
                     f"MarginV={SUBTITLE_SAFE_BOTTOM},MarginL={SUBTITLE_SAFE_SIDE},MarginR={SUBTITLE_SAFE_SIDE}'"
                 )
@@ -304,10 +331,6 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         command = [
             "ffmpeg", "-v", "error", "-y",
             "-ss", str(clip["start"]), "-i", manifest["source_path"],
-        ]
-        if srt_input_path is not None:
-            command.extend(["-i", str(srt_input_path)])
-        command.extend([
             "-t", str(duration),
             "-map", "0:v:0", "-map", "0:a:0",
             "-vf", vf,
@@ -316,31 +339,35 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             str(temporary),
-        ])
+        ]
         log_path = target.with_suffix(".ffmpeg.log")
-        with log_path.open("w", encoding="utf-8") as stderr:
-            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=stderr)
-        if result.returncode:
-            raise RuntimeError(f"FFmpeg (Shorts {clip['candidate_id']}) завершился с кодом "
-                               f"{result.returncode}. Подробности: {log_path}")
-        rendered = _probe_basic(temporary)
-        if (rendered["width"], rendered["height"]) != (SHORTS_OUTPUT_W, SHORTS_OUTPUT_H):
-            raise RuntimeError(
-                f"Разрешение Shorts {clip['candidate_id']}: "
-                f"{rendered['width']}x{rendered['height']}, ожидается {SHORTS_OUTPUT_W}x{SHORTS_OUTPUT_H}.")
-        if abs(rendered["duration_sec"] - duration) > 0.3:
-            raise RuntimeError(
-                f"Длительность Shorts {clip['candidate_id']} не соответствует утверждённому интервалу.")
-        temporary.rename(target)
-        save_json(target.with_suffix(".json"), {
-            "source": manifest,
-            "approved_candidate": clip,
-            "output": str(target),
-            "media": rendered,
-            "crop": {"width": crop_w, "height": crop_h, "x": cx, "y": cy,
-                     "mode": crop_mode, "crop_x": crop_x},
-            "subtitles": {"enabled": subtitles_on},
-        })
-        outputs.append(str(target))
-        log(f"Сохранено: {target}")
+        try:
+            with log_path.open("w", encoding="utf-8") as stderr:
+                result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=stderr)
+            if result.returncode:
+                raise RuntimeError(f"FFmpeg (Shorts {clip['candidate_id']}) завершился с кодом "
+                                   f"{result.returncode}. Подробности: {log_path}")
+            rendered = _probe_basic(temporary)
+            if (rendered["width"], rendered["height"]) != (SHORTS_OUTPUT_W, SHORTS_OUTPUT_H):
+                raise RuntimeError(
+                    f"Разрешение Shorts {clip['candidate_id']}: "
+                    f"{rendered['width']}x{rendered['height']}, ожидается {SHORTS_OUTPUT_W}x{SHORTS_OUTPUT_H}.")
+            if abs(rendered["duration_sec"] - duration) > 0.3:
+                raise RuntimeError(
+                    f"Длительность Shorts {clip['candidate_id']} не соответствует утверждённому интервалу.")
+            temporary.rename(target)
+            save_json(target.with_suffix(".json"), {
+                "source": manifest,
+                "approved_candidate": clip,
+                "output": str(target),
+                "media": rendered,
+                "crop": {"width": crop_w, "height": crop_h, "x": cx, "y": cy,
+                         "mode": crop_mode, "crop_x": crop_x},
+                "subtitles": {"enabled": subtitles_on},
+            })
+            outputs.append(str(target))
+            log(f"Сохранено: {target}")
+        finally:
+            if tmp_srt_path and Path(tmp_srt_path).exists():
+                Path(tmp_srt_path).unlink()
     return outputs

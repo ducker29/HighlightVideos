@@ -143,7 +143,6 @@ class HighlightApp:
         
         # Notebook с вкладками
         self.notebook = ttk.Notebook(panes)
-        self.notebook.pack(fill="both", expand=True)
         
         # Вкладка Хайлайты
         highlights_tab = ttk.Frame(self.notebook)

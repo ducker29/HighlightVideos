@@ -407,6 +407,8 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
                     analysis_warnings.append(warning)
                     analysis_complete = False
         if shorts_candidates:
+            for index, candidate in enumerate(shorts_candidates, 1):
+                candidate["candidate_id"] = f"sc{index:03d}"
             log(f"PASS-Shorts: найдено {len(shorts_candidates)} кандидатов на Shorts.")
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
               "profiles": normalize_profiles(settings.get("outputs")),
