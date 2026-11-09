@@ -231,5 +231,124 @@ class OpenReportMigrationTests(unittest.TestCase):
         self.assertEqual(context["report"]["candidates"][0]["approval_key"], "x")
 
 
+class LegacyOpenReportTests(unittest.TestCase):
+    """Stage 7.4.2: открытие старого report.json без shorts_candidates/profiles/format."""
+
+    def _make_job(self, report):
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp())
+        job_dir = tmp / "data" / "vid" / "analysis" / "sig"
+        job_dir.mkdir(parents=True)
+        data_vid = tmp / "data" / "vid"
+        save_json(data_vid / "source.json", {"video_id": "vid"})
+        save_json(job_dir / "report.json", report)
+        save_json(job_dir / "transcript.json", {"sentences": []})
+        return job_dir / "report.json"
+
+    def test_open_legacy_report_gets_empty_shorts_candidates(self):
+        """open_report добавляет пустой shorts_candidates к legacy-отчёту."""
+        report = {
+            "schema": 1,
+            "video_id": "vid",
+            "settings": {},
+            "candidates": [
+                {"candidate_id": "c001", "start": 10, "end": 130, "title": "А",
+                 "status": "approved", "approval_key": "x"},
+            ],
+        }
+        path = self._make_job(report)
+        context = open_report(path)
+        self.assertIn("shorts_candidates", context["report"])
+        self.assertEqual(context["report"]["shorts_candidates"], [])
+
+    def test_open_legacy_report_profiles_are_complete(self):
+        """open_report добавляет корректные профили (highlights 16:9, shorts 9:16)."""
+        report = {
+            "schema": 1,
+            "video_id": "vid",
+            "settings": {},
+            "candidates": [],
+        }
+        path = self._make_job(report)
+        context = open_report(path)
+        profiles = context["report"]["profiles"]
+        self.assertEqual(profiles["highlights"]["aspect_ratio"], "16:9")
+        self.assertEqual(profiles["highlights"]["min_duration_sec"], 120)
+        self.assertEqual(profiles["highlights"]["max_duration_sec"], 300)
+        self.assertEqual(profiles["highlights"]["end_padding_sec"], 0.5)
+        self.assertFalse(profiles["shorts"]["enabled"])
+        self.assertEqual(profiles["shorts"]["aspect_ratio"], "9:16")
+        self.assertEqual(profiles["shorts"]["min_duration_sec"], 20)
+        self.assertEqual(profiles["shorts"]["max_duration_sec"], 60)
+        self.assertEqual(profiles["shorts"]["crop_mode"], "center")
+        self.assertTrue(profiles["shorts"]["subtitles_enabled"])
+
+    def test_open_legacy_report_preserves_editorial_fields(self):
+        """Старые Highlights-кандидаты получают format, а редакторские поля не теряются."""
+        report = {
+            "schema": 1,
+            "video_id": "vid",
+            "settings": {},
+            "candidates": [
+                {"candidate_id": "c001", "start": 10, "end": 130, "title": "Тема 1",
+                 "status": "approved", "approval_key": "x",
+                 "score": 8, "reason": "Тестовая причина",
+                 "manual_bounds": True, "duration_sec": 120,
+                 "warnings": ["предупреждение 1"],
+                 "end_padding": {"base_end": 130, "padded_end": 130.5,
+                                  "applied_sec": 0.5, "requested_sec": 0.5}},
+                {"candidate_id": "c002", "start": 200, "end": 320, "title": "Тема 2",
+                 "status": "pending", "score": 6, "reason": "Другая причина"},
+                {"candidate_id": "c003", "start": 400, "end": 500, "title": "Тема 3",
+                 "status": "rejected", "score": 3, "reason": "Ещё причина"},
+            ],
+        }
+        path = self._make_job(report)
+        context = open_report(path)
+        candidates = {c["candidate_id"]: c for c in context["report"]["candidates"]}
+        # Формат добавлен каждому.
+        for cid in ("c001", "c002", "c003"):
+            self.assertEqual(candidates[cid]["format"], "highlight")
+        # Редакторские поля c001 сохранены.
+        c1 = candidates["c001"]
+        self.assertEqual(c1["title"], "Тема 1")
+        self.assertEqual(c1["status"], "approved")
+        self.assertEqual(c1["approval_key"], "x")
+        self.assertEqual(c1["score"], 8)
+        self.assertEqual(c1["reason"], "Тестовая причина")
+        self.assertTrue(c1["manual_bounds"])
+        self.assertEqual(c1["duration_sec"], 120)
+        self.assertEqual(c1["warnings"], ["предупреждение 1"])
+        self.assertEqual(c1["end_padding"]["base_end"], 130)
+        self.assertEqual(c1["end_padding"]["padded_end"], 130.5)
+        self.assertEqual(c1["start"], 10)
+        self.assertEqual(c1["end"], 130)
+        # Статусы c002/c003 не изменены.
+        self.assertEqual(candidates["c002"]["status"], "pending")
+        self.assertEqual(candidates["c003"]["status"], "rejected")
+
+    def test_open_report_does_not_rewrite_report_json(self):
+        """Простое открытие не перезаписывает report.json на диске."""
+        report = {
+            "schema": 1,
+            "video_id": "vid",
+            "settings": {},
+            "candidates": [
+                {"candidate_id": "c001", "start": 10, "end": 130, "title": "А",
+                 "status": "approved", "approval_key": "x"},
+            ],
+        }
+        path = self._make_job(report)
+        content_before = path.read_text(encoding="utf-8")
+        context = open_report(path)
+        content_after = path.read_text(encoding="utf-8")
+        self.assertEqual(content_before, content_after,
+                         "open_report не должен перезаписывать report.json на диске")
+        # Контекст содержит смигрированный отчёт (в памяти), но файл не тронут.
+        self.assertIn("shorts_candidates", context["report"])
+        self.assertEqual(context["report"]["candidates"][0]["format"], "highlight")
+
+
 if __name__ == "__main__":
     unittest.main()

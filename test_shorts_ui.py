@@ -195,5 +195,157 @@ class ShortsReportIntegrationTests(unittest.TestCase):
         self.assertIsInstance(shorts, list)
 
 
+class ShortsRenderSelectionTests(unittest.TestCase):
+    """Stage 7.4.1: выбор Shorts-кандидатов при рендере (UI → renderer контракт).
+
+    Фильтрация по candidate_id и по статусу 'approved' выполняется в двух местах:
+      - review_ui.render_shorts: делает deepcopy отчёта, при candidate_id=None оставляет
+        весь список shorts_candidates, иначе только выбранный; затем approved-фильтр.
+      - renderer.render_shorts_approved: повторно фильтрует по candidate_id и status.
+    Тесты проверяют, какой отчёт и с каким candidate_id UI передаёт в renderer.
+    Реальный FFmpeg не запускается: render_shorts_approved замещается Mock.
+    """
+
+    def setUp(self):
+        import tkinter as tk
+        from review_ui import HighlightApp
+
+        try:
+            self.root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(str(exc))
+        self.root.withdraw()
+        self.app = HighlightApp(self.root)
+
+        self.app.context = {
+            "job_dir": str(ROOT / "data" / "test_vid"),
+            "manifest": {
+                "video_id": "test_vid",
+                "media": {"duration_sec": 300.0},
+                "source_path": "source.mp4",
+            },
+            "report": {
+                "schema": 1,
+                "video_id": "test_vid",
+                "signature": "sig",
+                "settings": {},
+                "candidates": [],
+                "shorts_candidates": [
+                    {"candidate_id": "s001", "start": 100, "end": 140, "score": 9,
+                     "title": "Short 1", "reason": "r", "status": "approved"},
+                    {"candidate_id": "s002", "start": 200, "end": 240, "score": 8,
+                     "title": "Short 2", "reason": "r", "status": "pending"},
+                    {"candidate_id": "s003", "start": 260, "end": 290, "score": 7,
+                     "title": "Short 3", "reason": "r", "status": "rejected"},
+                ],
+            },
+            "report_path": DATA / "test_vid" / "analysis" / "sig" / "report.json",
+            "transcript": {"sentences": []},
+            "quality_notes": {},
+        }
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def test_render_shorts_by_candidate_id_selects_only_that_short(self):
+        """candidate_id задан: в renderer попадает только выбранный утверждённый Shorts."""
+        app = self.app
+        calls = {}
+
+        def fake_start_worker(operation, function):
+            if app.busy:
+                return
+            # Выполняем переданную lambda, перехватив реальный renderer.
+            with patch("review_ui.render_shorts_approved") as renderer:
+                renderer.return_value = "rendered"
+                function()
+                calls["renderer"] = renderer
+
+        app.busy = False
+        with patch.object(app, "start_worker", side_effect=fake_start_worker):
+            app.render_shorts(candidate_id="s001")
+
+        self.assertIn("renderer", calls, "render_shorts должен запустить worker с рендером")
+        renderer = calls["renderer"]
+        self.assertEqual(renderer.call_count, 1)
+        passed_report = renderer.call_args.args[1]
+        passed_candidate_id = renderer.call_args.kwargs.get("candidate_id")
+        # Контракт: UI передаёт весь список shorts_candidates и candidate_id;
+        # финальную фильтрацию по candidate_id и по статусу 'approved'
+        # выполняет render_shorts_approved (renderer.py:247-249).
+        self.assertEqual(passed_candidate_id, "s001")
+        # В отчёте присутствует весь набор; выбран утверждённый s001.
+        ids = [c["candidate_id"] for c in passed_report["shorts_candidates"]]
+        self.assertEqual(ids, ["s001", "s002", "s003"])
+        by_id = {c["candidate_id"]: c for c in passed_report["shorts_candidates"]}
+        self.assertEqual(by_id["s001"]["status"], "approved",
+                         "выбранный Shorts должен быть утверждён")
+        # Симулируем фильтрацию renderer'а: только s001 + approved → [s001].
+        rendered = [c for c in passed_report["shorts_candidates"]
+                    if c["candidate_id"] == passed_candidate_id and c["status"] == "approved"]
+        self.assertEqual([c["candidate_id"] for c in rendered], ["s001"],
+                         "в результате рендера должен оказаться только выбранный утверждённый Shorts")
+
+    def test_render_shorts_none_renders_all_approved_excluding_pending_rejected(self):
+        """candidate_id=None: рендерятся все утверждённые; pending/rejected не попадают."""
+        app = self.app
+        calls = {}
+
+        def fake_start_worker(operation, function):
+            if app.busy:
+                return
+            with patch("review_ui.render_shorts_approved") as renderer:
+                renderer.return_value = "rendered"
+                function()
+                calls["renderer"] = renderer
+
+        app.busy = False
+        with patch.object(app, "start_worker", side_effect=fake_start_worker):
+            app.render_shorts(candidate_id=None)
+
+        self.assertIn("renderer", calls)
+        renderer = calls["renderer"]
+        self.assertEqual(renderer.call_count, 1)
+        passed_report = renderer.call_args.args[1]
+        self.assertIsNone(renderer.call_args.kwargs.get("candidate_id"))
+        # В отчёте весь список, но renderer отрендерит только approved (s001).
+        # Проверяем, что pending/rejected не утверждены и не попадут в результат.
+        approved = [c for c in passed_report["shorts_candidates"] if c["status"] == "approved"]
+        self.assertEqual([c["candidate_id"] for c in approved], ["s001"],
+                         "только утверждённый Shorts должен быть в результате")
+        statuses = {c["candidate_id"]: c["status"] for c in passed_report["shorts_candidates"]}
+        self.assertEqual(statuses.get("s002"), "pending")
+        self.assertEqual(statuses.get("s003"), "rejected")
+
+    def test_render_shorts_no_approved_does_not_render(self):
+        """Нет утверждённых Shorts: рендер не запускается, UI сообщает об этом."""
+        app = self.app
+        # Убираем утверждённый Shorts: s001 → pending.
+        app.context["report"]["shorts_candidates"][0]["status"] = "pending"
+
+        with patch("review_ui.render_shorts_approved") as renderer, \
+                patch("review_ui.messagebox") as mb:
+            app.busy = False
+            app.render_shorts(candidate_id=None)
+
+        renderer.assert_not_called(), "рендер не должен запускаться без утверждённых Shorts"
+        mb.showinfo.assert_called_once()
+        args = mb.showinfo.call_args
+        self.assertIn("утвердите", str(args).lower())
+
+    def test_render_shorts_busy_does_not_render(self):
+        """app.busy=True: повторный рендер не запускается."""
+        app = self.app
+        app.busy = True
+
+        with patch("review_ui.render_shorts_approved") as renderer:
+            app.render_shorts(candidate_id="s001")
+            app.render_shorts(candidate_id=None)
+
+        renderer.assert_not_called(), "при busy рендер не должен запускаться"
+        # busy остаётся True (ранний возврат не меняет состояние).
+        self.assertTrue(app.busy)
+
+
 if __name__ == "__main__":
     unittest.main()

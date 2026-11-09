@@ -363,5 +363,142 @@ class DecideShortsHandlerTests(unittest.TestCase):
             self.assertNotIn("approval_key", saved)
 
 
+class UIIndependenceTests(unittest.TestCase):
+    """Stage 7.4.3: реальные decide/decide_shorts не затрагивают другую ветку."""
+
+    def _make_app(self, report, tmp, start_time="0:02:00", end_time="0:04:00"):
+        from review_ui import HighlightApp
+        app = HighlightApp.__new__(HighlightApp)
+        app.busy = False
+        report_path = Path(tmp) / "report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(report_path, report)
+        app.context = {
+            "report_path": report_path,
+            "report": report,
+            "manifest": {"media": {"duration_sec": 600.0}},
+        }
+        # Highlights-таблица
+        app.table = unittest.mock.Mock()
+        app.table.selection.return_value = ("c001",)
+        # Shorts-таблица
+        app.shorts_table = unittest.mock.Mock()
+        app.shorts_table.selection.return_value = ("sc001",)
+        # Виджеты границ
+        app.start = unittest.mock.Mock()
+        app.start.get.return_value = start_time
+        app.end = unittest.mock.Mock()
+        app.end.get.return_value = end_time
+        app.title = unittest.mock.Mock()
+        app.title.get.return_value = "Test"
+        # Кнопки-обработчики
+        app.refresh_table = unittest.mock.Mock()
+        app.refresh_shorts_table = unittest.mock.Mock()
+        app.root = unittest.mock.Mock()
+        app.notebook = unittest.mock.Mock()
+        app.notebook.index.return_value = 0
+        app.notebook.select.return_value = ""
+        return app
+
+    def test_decide_shorts_does_not_modify_highlights(self):
+        """decide_shorts('approved') не изменяет candidates Highlights."""
+        report = make_report()
+        hl_before = copy.deepcopy(report["candidates"])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._make_app(report, tmp, start_time="0:00:10", end_time="0:00:45")
+            app.decide_shorts("approved")
+
+            self.assertEqual(app.context["report"]["candidates"], hl_before,
+                             "decide_shorts не должен изменять candidates Highlights")
+            self.assertEqual(app.context["report"]["candidates"][0]["status"], "pending")
+            self.assertNotIn("approval_key", app.context["report"]["candidates"][0])
+            # Shorts должен быть утверждён
+            sc = app.context["report"]["shorts_candidates"][0]
+            self.assertEqual(sc["status"], "approved")
+            self.assertIn("approval_key", sc)
+
+    def test_decide_highlights_does_not_modify_shorts(self):
+        """decide('approved') на Highlights не изменяет shorts_candidates."""
+        report = make_report()
+        sc_before = copy.deepcopy(report["shorts_candidates"])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._make_app(report, tmp)
+            # Реальный decide (не переопределяем)
+            # _is_shorts_tab вернёт False, т.к. notebook.index == 0
+            app.decide("approved")
+
+            self.assertEqual(app.context["report"]["shorts_candidates"], sc_before,
+                             "decide Highlights не должен изменять shorts_candidates")
+            self.assertEqual(app.context["report"]["shorts_candidates"][0]["status"], "pending")
+            self.assertNotIn("approval_key", app.context["report"]["shorts_candidates"][0])
+            # Highlights должен быть утверждён
+            hl = app.context["report"]["candidates"][0]
+            self.assertEqual(hl["status"], "approved")
+            self.assertIn("approval_key", hl)
+
+    def test_highlights_approval_preserves_shorts_approval_key(self):
+        """Утверждение Highlights не сбрасывает уже сохранённый shorts approval_key."""
+        report = make_report()
+        # Сначала утвердим Shorts
+        sc = report["shorts_candidates"][0]
+        sc["status"] = "approved"
+        sc["approval_key"] = shorts_approval_key(sc)
+        shorts_key_before = sc["approval_key"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._make_app(report, tmp)
+            app.decide("approved")  # утверждаем Highlights (реальный decide)
+
+            hl = app.context["report"]["candidates"][0]
+            sc_after = app.context["report"]["shorts_candidates"][0]
+            self.assertEqual(hl["status"], "approved")
+            self.assertEqual(sc_after["approval_key"], shorts_key_before,
+                             "approval_key Shorts не должен сбрасываться при утверждении Highlights")
+            self.assertEqual(sc_after["status"], "approved")
+
+    def test_shorts_approval_preserves_highlights_approval_key(self):
+        """Утверждение Shorts не сбрасывает уже сохранённый highlights approval_key."""
+        report = make_report()
+        # Сначала утвердим Highlights
+        hl = report["candidates"][0]
+        hl["status"] = "approved"
+        hl["approval_key"] = approval_key(hl)
+        highlights_key_before = hl["approval_key"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._make_app(report, tmp, start_time="0:00:10", end_time="0:00:45")
+            app.decide_shorts("approved")  # утверждаем Shorts (реальный decide_shorts)
+
+            hl_after = app.context["report"]["candidates"][0]
+            self.assertEqual(hl_after["approval_key"], highlights_key_before,
+                             "approval_key Highlights не должен сбрасываться при утверждении Shorts")
+            self.assertEqual(hl_after["status"], "approved")
+            sc = app.context["report"]["shorts_candidates"][0]
+            self.assertEqual(sc["status"], "approved")
+
+    def test_saved_report_preserves_both_branches_on_reload(self):
+        """Сохранённый отчёт: при повторном открытии решения обеих веток остаются."""
+        report = make_report()
+        hl = report["candidates"][0]
+        hl["status"] = "approved"
+        hl["approval_key"] = approval_key(hl)
+        sc = report["shorts_candidates"][0]
+        sc["status"] = "approved"
+        sc["approval_key"] = shorts_approval_key(sc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "report.json"
+            save_json(report_path, report)
+
+            # Повторное открытие
+            reloaded = load_json(report_path)
+            self.assertEqual(reloaded["candidates"][0]["status"], "approved")
+            self.assertEqual(reloaded["candidates"][0]["approval_key"],
+                             approval_key(reloaded["candidates"][0]))
+            self.assertEqual(reloaded["shorts_candidates"][0]["status"], "approved")
+            self.assertEqual(reloaded["shorts_candidates"][0]["approval_key"],
+                             shorts_approval_key(reloaded["shorts_candidates"][0]))
+
+
 if __name__ == "__main__":
     unittest.main()
