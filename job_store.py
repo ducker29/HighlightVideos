@@ -215,4 +215,7 @@ def migrate_report(report):
     for candidate in report.get("candidates", []):
         if "format" not in candidate:
             candidate["format"] = "highlight"
+    # Добавляем пустой список Shorts, если его нет (обратная совместимость)
+    if "shorts_candidates" not in report:
+        report["shorts_candidates"] = []
     return report

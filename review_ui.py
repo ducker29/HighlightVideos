@@ -39,6 +39,10 @@ class HighlightApp:
             self.settings.update(load_json(saved))
         self.variables = {key: tk.StringVar(value=str(value)) for key, value in self.settings.items()}
         self.variables["analyze_full_video"] = tk.BooleanVar(value=self.settings.get("analyze_full_video", True))
+        # Shorts настройки
+        self.variables["shorts_min_duration_sec"] = tk.StringVar(value=str(self.settings.get("shorts_min_duration_sec", 20)))
+        self.variables["shorts_target_duration_sec"] = tk.StringVar(value=str(self.settings.get("shorts_target_duration_sec", 40)))
+        self.variables["shorts_max_duration_sec"] = tk.StringVar(value=str(self.settings.get("shorts_max_duration_sec", 60)))
         self.status = tk.StringVar(value="Готово. Укажите ссылку и длительность, затем запустите анализ.")
         self._build()
         self.start.trace_add("write", self._review_bounds_changed)
@@ -97,8 +101,22 @@ class HighlightApp:
                                            values=(self.settings["editorial_model"],))
         self.editorial_choice.grid(columnspan=5)
 
+        # Настройки Shorts
+        shorts_settings = ttk.Frame(settings)
+        shorts_settings.grid(row=5, column=0, columnspan=6, sticky="ew", pady=4)
+        self.shorts_enabled_var = tk.BooleanVar(value=self.settings.get("shorts_enabled", False))
+        checkbox = ttk.Checkbutton(shorts_settings, text="Включить Shorts 9:16", variable=self.shorts_enabled_var)
+        checkbox.grid(row=0, column=0, padx=(0, 12), sticky="w")
+        self.controls.append(checkbox)
+        ttk.Label(shorts_settings, text="Мин. длительность:").grid(row=0, column=1)
+        self.entry(shorts_settings, "shorts_min_duration_sec", 0, 2, width=6)
+        ttk.Label(shorts_settings, text="Целевая:").grid(row=0, column=3)
+        self.entry(shorts_settings, "shorts_target_duration_sec", 0, 4, width=6)
+        ttk.Label(shorts_settings, text="Макс. длительность:").grid(row=0, column=5)
+        self.entry(shorts_settings, "shorts_max_duration_sec", 0, 6, width=6)
+
         scope = ttk.Frame(settings)
-        scope.grid(row=5, column=0, columnspan=6, sticky="ew", pady=4)
+        scope.grid(row=6, column=0, columnspan=6, sticky="ew", pady=4)
         checkbox = ttk.Checkbutton(scope, text="Анализ полного видео", variable=self.variables["analyze_full_video"])
         checkbox.grid(row=0, column=0, padx=(0, 12), sticky="w")
         self.controls.append(checkbox)
@@ -113,15 +131,25 @@ class HighlightApp:
         self.button(actions, "Скачать и найти кандидатов", self.analyze, row=0, column=0, padx=(0, 8))
         self.button(actions, "Открыть сохранённый отчёт", self.load_report, row=0, column=1, padx=8)
         self.button(actions, "Нарезать утвержденные клипы", self.render, row=0, column=2, padx=8)
+        self.button(actions, "Рендер Shorts (Stage 6)", self.render_shorts, row=0, column=3, padx=8)
         self.button(actions, "Применить запас к отчёту", self.apply_end_padding,
-                    row=0, column=3, padx=8)
+                    row=0, column=4, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
-        self.progress.grid(row=0, column=4, padx=8)
+        self.progress.grid(row=0, column=5, padx=8)
         ttk.Label(outer, textvariable=self.status, wraplength=1180).pack(fill="x", pady=(0, 5))
 
         panes = ttk.Panedwindow(outer, orient="vertical")
         panes.pack(fill="both", expand=True)
-        table_frame = ttk.Frame(panes)
+        
+        # Notebook с вкладками
+        self.notebook = ttk.Notebook(panes)
+        self.notebook.pack(fill="both", expand=True)
+        
+        # Вкладка Хайлайты
+        highlights_tab = ttk.Frame(self.notebook)
+        self.notebook.add(highlights_tab, text="Хайлайты 16:9")
+        
+        table_frame = ttk.Frame(highlights_tab)
         columns = ("candidate_id", "status", "start", "end", "duration", "score", "title", "padding", "render")
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=8, selectmode="browse")
         for key, label, width in zip(columns, ("ID", "Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок", "Запас", "Нарезка"),
@@ -134,7 +162,27 @@ class HighlightApp:
         scroll.pack(side="right", fill="y")
         self.table.bind("<<TreeviewSelect>>", lambda event: self.show_candidate())
         self.table.bind("<Button-1>", self.table_action)
-        panes.add(table_frame, weight=2)
+        table_frame.pack(fill="both", expand=True)
+        
+        # Вкладка Shorts
+        shorts_tab = ttk.Frame(self.notebook)
+        self.notebook.add(shorts_tab, text="Shorts 9:16")
+        
+        shorts_table_frame = ttk.Frame(shorts_tab)
+        shorts_columns = ("candidate_id", "status", "start", "end", "duration", "score", "title", "render")
+        self.shorts_table = ttk.Treeview(shorts_table_frame, columns=shorts_columns, show="headings", height=8, selectmode="browse")
+        for key, label, width in zip(shorts_columns, ("ID", "Решение", "Начало", "Конец", "Длина, с", "Оценка", "Тема / заголовок", "Рендер"),
+                                     (65, 110, 100, 100, 75, 60, 270, 95)):
+            self.shorts_table.heading(key, text=label)
+            self.shorts_table.column(key, width=width, stretch=(key == "title"))
+        shorts_scroll = ttk.Scrollbar(shorts_table_frame, orient="vertical", command=self.shorts_table.yview)
+        self.shorts_table.configure(yscrollcommand=shorts_scroll.set)
+        self.shorts_table.pack(side="left", fill="both", expand=True)
+        shorts_scroll.pack(side="right", fill="y")
+        self.shorts_table.bind("<<TreeviewSelect>>", lambda event: self.show_shorts_candidate())
+        shorts_table_frame.pack(fill="both", expand=True)
+        
+        panes.add(self.notebook, weight=2)
 
         review = ttk.LabelFrame(panes, text="Ревью выбранного кандидата", padding=6)
         fields = ttk.Frame(review)
@@ -229,6 +277,14 @@ class HighlightApp:
                 self.variables["analysis_end_min"].set(f"{interval['end'] / 60:.12g}")
             else:
                 self.variables["analyze_full_video"].set(True)
+        # Восстанавливаем настройки Shorts
+        if "outputs" in settings and "shorts" in settings["outputs"]:
+            shorts = settings["outputs"]["shorts"]
+            self.shorts_enabled_var.set(shorts.get("enabled", False))
+            if shorts.get("enabled"):
+                self.variables["shorts_min_duration_sec"].set(str(shorts.get("min_duration_sec", 20)))
+                self.variables["shorts_target_duration_sec"].set(str(shorts.get("target_duration_sec", 40)))
+                self.variables["shorts_max_duration_sec"].set(str(shorts.get("max_duration_sec", 60)))
         self.sync_analysis_range()
 
     def _poll(self):
@@ -254,6 +310,7 @@ class HighlightApp:
                         self.context = result
                         self.restore_report_settings(result)
                         self.refresh_table()
+                        self.refresh_shorts_table()
                         for warning in result["report"].get("analysis_warnings", []) + result["report"].get("editorial_warnings", []):
                             self.append_log(warning)
                         rejections = result["report"].get("editorial_rejections", [])
@@ -322,6 +379,21 @@ class HighlightApp:
             raise ValueError("Устройство должно быть cpu или cuda.")
         if not all(settings[k] for k in ("youtube_url", "asr_model", "llm_model", "ollama_url")):
             raise ValueError("Заполните ссылку и названия моделей.")
+        # Shorts настройки
+        if self.shorts_enabled_var.get():
+            settings["outputs"] = {
+                "shorts": {
+                    "enabled": True,
+                    "aspect_ratio": "9:16",
+                    "min_duration_sec": int(settings.get("shorts_min_duration_sec", 20)),
+                    "target_duration_sec": int(settings.get("shorts_target_duration_sec", 40)),
+                    "max_duration_sec": int(settings.get("shorts_max_duration_sec", 60)),
+                    "crop_mode": "center",
+                    "subtitles_enabled": True,
+                    "max_candidates": 30,
+                    "final_candidates": 10,
+                }
+            }
         return settings
 
     def refresh_models(self):
@@ -432,6 +504,8 @@ class HighlightApp:
             self.end.set("")
             self.title.set("")
             self.set_details("Подходящих кандидатов не найдено. Произвольные интервалы не создаются.")
+        # Обновляем также таблицу Shorts
+        self.refresh_shorts_table(selected)
 
     def set_details(self, text, chunks=None):
         self.details.configure(state="normal")
@@ -442,6 +516,10 @@ class HighlightApp:
         self.details.configure(state="disabled")
 
     def show_candidate(self):
+        # Если активна вкладка Shorts, переключаемся на Shorts
+        if self._is_shorts_tab():
+            self.show_shorts_candidate()
+            return
         candidate = self.current_candidate()
         if not candidate:
             return
@@ -525,6 +603,10 @@ class HighlightApp:
     def decide(self, status):
         if self.busy:
             return
+        # Если активна вкладка Shorts, используем Shorts-логику
+        if self._is_shorts_tab():
+            self.decide_shorts(status)
+            return
         try:
             candidate = self.edited_candidate()
             candidate["status"] = status
@@ -533,7 +615,7 @@ class HighlightApp:
                 candidate["approval_key"] = approval_key(candidate)
             updated = copy.deepcopy(self.context["report"])
             updated["candidates"] = [candidate if c["candidate_id"] == candidate["candidate_id"] else c
-                                     for c in updated["candidates"]]
+                                      for c in updated["candidates"]]
             save_json(self.context["report_path"], updated)
             self.context["report"] = updated
             self.refresh_table(candidate["candidate_id"])
@@ -541,6 +623,13 @@ class HighlightApp:
             messagebox.showerror("Ревью", str(exc), parent=self.root)
 
     def has_unsaved_edits(self):
+        # Если активна вкладка Shorts, проверяем Shorts-кандидата
+        if self._is_shorts_tab():
+            candidate = self.current_shorts_candidate()
+            if candidate is None:
+                return False
+            return (self.start.get() != timecode(candidate["start"]) or self.end.get() != timecode(candidate["end"])
+                    or self.title.get().strip() != candidate["title"])
         candidate = self.current_candidate()
         if candidate is None:
             return False
@@ -548,6 +637,7 @@ class HighlightApp:
                 or self.title.get().strip() != candidate["title"])
 
     def render(self, candidate_id=None):
+        # Рендер работает только для хайлайтов
         if self.busy:
             return
         if not self.context:
@@ -577,9 +667,20 @@ class HighlightApp:
         self.start_worker("Финальная нарезка утверждённых интервалов…",
                           lambda: render_approved(manifest, report, job_dir, self.log, transcript=transcript))
 
+    def render_shorts(self):
+        """Рендер Shorts (заглушка для Stage 6)."""
+        messagebox.showinfo("Рендер Shorts",
+                            "Рендер Shorts 9:16 будет реализован в Stage 6.\n"
+                            "На данный момент доступна только редакторская проверка.",
+                            parent=self.root)
+
     def preview(self):
         try:
-            candidate = self.edited_candidate()
+            # Если активна вкладка Shorts, используем Shorts-кандидата
+            if self._is_shorts_tab():
+                candidate = self.edited_shorts_candidate()
+            else:
+                candidate = self.edited_candidate()
             if not shutil.which("ffplay"):
                 raise ValueError("Для просмотра интервала нужен ffplay в PATH (входит в полную сборку FFmpeg).")
             subprocess.Popen(["ffplay", "-autoexit", "-loglevel", "error", "-ss", str(candidate["start"]),
@@ -596,6 +697,145 @@ class HighlightApp:
         if self.has_unsaved_edits() and not messagebox.askyesno("Несохранённые правки", "Закрыть окно без сохранения правок?", parent=self.root):
             return
         self.root.destroy()
+
+    # --- Shorts 9:16 ---
+
+    def _is_shorts_tab(self):
+        """Возвращает True, если активна вкладка Shorts."""
+        return self.notebook.index(self.notebook.select()) == 1
+
+    def _is_highlights_tab(self):
+        """Возвращает True, если активна вкладка Хайлайты."""
+        return self.notebook.index(self.notebook.select()) == 0
+
+    def current_shorts_candidate(self):
+        """Возвращает текущего выбранного Shorts-кандидата."""
+        selected = self.shorts_table.selection()
+        if not selected or not self.context:
+            return None
+        return next((c for c in self.context["report"].get("shorts_candidates", []) if c["candidate_id"] == selected[0]), None)
+
+    def refresh_shorts_table(self, selected=None):
+        """Обновляет таблицу Shorts-кандидатов."""
+        self.shorts_table.delete(*self.shorts_table.get_children())
+        if not self.context:
+            return
+        for candidate in self.context["report"].get("shorts_candidates", []):
+            self.shorts_table.insert("", "end", iid=candidate["candidate_id"], values=(
+                candidate["candidate_id"], STATUS.get(candidate["status"], candidate["status"]),
+                timecode(candidate["start"]), timecode(candidate["end"]),
+                round(candidate["end"] - candidate["start"], 2), candidate["score"], candidate["title"],
+                "▶ Рендер*"))
+        children = self.shorts_table.get_children()
+        if children:
+            self.shorts_table.selection_set(selected if selected in children else children[0])
+        else:
+            self.start.set("")
+            self.end.set("")
+            self.title.set("")
+            self.set_details("Shorts-кандидаты не найдены. Проверьте, что Shorts включены в настройках.")
+        # Добавляем поясняющий текст
+        self.shorts_table.bind("<Button-1>", self.shorts_table_action)
+
+    def show_shorts_candidate(self):
+        """Показывает детали выбранного Shorts-кандидата."""
+        candidate = self.current_shorts_candidate()
+        if not candidate:
+            return
+        self._loading_candidate = True
+        try:
+            self.start.set(timecode(candidate["start"]))
+            self.end.set(timecode(candidate["end"]))
+            self.title.set(candidate["title"])
+        finally:
+            self._loading_candidate = False
+        self._update_shorts_candidate_details()
+
+    def _update_shorts_candidate_details(self, preserve_scroll=False):
+        """Обновляет детали для Shorts-кандидата."""
+        current = self.current_shorts_candidate()
+        if not current:
+            return
+        try:
+            start, end = validate_interval(parse_time(self.start.get()), parse_time(self.end.get()),
+                                           self.context["manifest"]["media"]["duration_sec"])
+        except (ValueError, OverflowError):
+            self.set_details("Границы редактируются. Введите корректные начало и конец.")
+            return
+        candidate = dict(current, start=start, end=end)
+        draft_bounds = abs(start - current["start"]) > 0.000001 or abs(end - current["end"]) > 0.000001
+        if draft_bounds:
+            candidate["manual_bounds"] = True
+        sections = review_sections(self.context["transcript"], start, end)
+        notes = self.context.get("quality_notes", {}).get(candidate["candidate_id"], {})
+        qa = ""
+        if notes and abs(notes["start"] - candidate["start"]) < 0.001 and abs(notes["end"] - candidate["end"]) < 0.001:
+            qa = "\n\nЗАМЕЧАНИЯ:\n" + "\n".join(notes["notes"])
+        draft_text = "ПРЕДПРОСМОТР: изменённые границы ещё не сохранены.\n" if draft_bounds else ""
+        self.set_details(f"ID: {candidate['candidate_id']}\n"
+                         f"Формат: 9:16 Shorts\n"
+                         f"{draft_text}"
+                         f"Почему выбран: {candidate['reason']}\n"
+                         + "\n".join(candidate.get("warnings", [])) + qa + "\n\n",
+                         chunks=transcript_chunks(sections))
+
+    def edited_shorts_candidate(self):
+        """Возвращает отредактированного Shorts-кандидата."""
+        current = self.current_shorts_candidate()
+        if not current:
+            raise ValueError("Выберите Shorts-кандидата.")
+        profiles = self.context["report"].get("profiles", {})
+        shorts_profile = profiles.get("shorts", {})
+        start, end = validate_interval(parse_time(self.start.get()), parse_time(self.end.get()),
+                                       self.context["manifest"]["media"]["duration_sec"],
+                                       shorts_profile.get("min_duration_sec", 20),
+                                       shorts_profile.get("max_duration_sec", 60))
+        candidate = dict(current, start=start, end=end, title=self.title.get().strip())
+        if "duration_sec" in candidate:
+            candidate["duration_sec"] = end - start
+        if abs(start - current["start"]) > 0.000001 or abs(end - current["end"]) > 0.000001:
+            candidate["manual_bounds"] = True
+        if not candidate["title"]:
+            raise ValueError("Введите заголовок.")
+        return candidate
+
+    def decide_shorts(self, status):
+        """Сохраняет решение для Shorts-кандидата."""
+        if self.busy:
+            return
+        try:
+            candidate = self.edited_shorts_candidate()
+            candidate["status"] = status
+            candidate.pop("approval_key", None)
+            if status == "approved":
+                candidate["approval_key"] = approval_key(candidate)
+            updated = copy.deepcopy(self.context["report"])
+            updated["shorts_candidates"] = [
+                candidate if c["candidate_id"] == candidate["candidate_id"] else c
+                for c in updated.get("shorts_candidates", [])
+            ]
+            save_json(self.context["report_path"], updated)
+            self.context["report"] = updated
+            self.refresh_shorts_table(candidate["candidate_id"])
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Ревью Shorts", str(exc), parent=self.root)
+
+    def shorts_table_action(self, event):
+        """Обработчик клика по таблице Shorts."""
+        row = self.shorts_table.identify_row(event.y)
+        column = self.shorts_table.identify_column(event.x)
+        if not row:
+            return
+        if self.busy:
+            return "break"
+        if self.has_unsaved_edits():
+            messagebox.showinfo("Ревью Shorts", "Сначала сохраните правки выбранного кандидата.", parent=self.root)
+            return "break"
+        self.shorts_table.selection_set(row)
+        self.show_shorts_candidate()
+        if column == "#8":  # Колонка "Рендер"
+            self.render_shorts()
+        return "break"
 
 
 def main(report_path=None):
