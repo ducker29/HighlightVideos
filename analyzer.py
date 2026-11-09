@@ -324,49 +324,55 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
     blocks = merge_windows(analyzed, maximum_span=max(900, settings["max_duration_sec"] + 300))
     for index, block in enumerate(blocks):
         log(f"PASS 2: тематический блок {index + 1}/{len(blocks)}")
-        if selection_method == "intervals":
-            from interval_selector import select_intervals
-            selection = select_intervals(block, transcript, settings, cache / f"block_{index:04d}", log)
-            analysis_warnings.extend(selection["warnings"])
-            analysis_complete = analysis_complete and selection["complete"]
-            candidates.extend(dict(candidate, block_id=index) for candidate in selection["candidates"])
-            continue
-        all_unique = {s["id"]: s for window in block for s in window["sentences"]}
-        all_sentences = sorted(all_unique.values(), key=lambda s: s["start"])
-        prefix = f"block_budget_v{CONTEXT_POLICY_VERSION}" if split_windows else "block"
-        path = cache / f"{prefix}_{index:04d}.json"
+        try:
+            if selection_method == "intervals":
+                from interval_selector import select_intervals
+                selection = select_intervals(block, transcript, settings, cache / f"block_{index:04d}", log)
+                analysis_warnings.extend(selection["warnings"])
+                analysis_complete = analysis_complete and selection["complete"]
+                candidates.extend(dict(candidate, block_id=index) for candidate in selection["candidates"])
+                continue
+            all_unique = {s["id"]: s for window in block for s in window["sentences"]}
+            all_sentences = sorted(all_unique.values(), key=lambda s: s["start"])
+            prefix = f"block_budget_v{CONTEXT_POLICY_VERSION}" if split_windows else "block"
+            path = cache / f"{prefix}_{index:04d}.json"
 
-        def build_clip(part):
-            return clip_prompt(part, block, settings)
+            def build_clip(part):
+                return clip_prompt(part, block, settings)
 
-        # Completed full-block results remain usable without submitting their prompts again.
-        parts = [all_sentences] if path.exists() else fit_sentence_groups(
-            all_sentences, build_clip, overlap_seconds=settings["max_duration_sec"])
-        if len(parts) > 1:
-            log(f"Блок {index + 1} разделён на {len(parts)} частей с перекрытием по бюджету запроса.")
-        for part_index, sentences in enumerate(parts):
-            unique = {s["id"]: s for s in sentences}
-            part_key = hashlib.sha256(sentence_json(sentences).encode()).hexdigest()[:10]
-            part_path = path if len(parts) == 1 else cache / f"{prefix}_{index:04d}_part_{part_index:03d}_{part_key}.json"
+            # Completed full-block results remain usable without submitting their prompts again.
+            parts = [all_sentences] if path.exists() else fit_sentence_groups(
+                all_sentences, build_clip, overlap_seconds=settings["max_duration_sec"])
+            if len(parts) > 1:
+                log(f"Блок {index + 1} разделён на {len(parts)} частей с перекрытием по бюджету запроса.")
+            for part_index, sentences in enumerate(parts):
+                unique = {s["id"]: s for s in sentences}
+                part_key = hashlib.sha256(sentence_json(sentences).encode()).hexdigest()[:10]
+                part_path = path if len(parts) == 1 else cache / f"{prefix}_{index:04d}_part_{part_index:03d}_{part_key}.json"
 
-            if part_path.exists():
-                selected = load_json(part_path)
-            else:
-                selected = collect_clips(settings, build_clip(sentences), sentences, transcript["duration_sec"],
-                                         part_path.with_name(part_path.stem + "_attempts.json"), log,
-                                         f"Блок {index + 1}, часть {part_index + 1}")
-                save_json(part_path, selected)
-            if not isinstance(selected, dict) or not isinstance(selected.get("clips"), list):
-                raise ValueError(f"Повреждён кеш кандидатов: {part_path}")
-            analysis_warnings.extend(selected.get("selection_warnings", []))
-            analysis_complete = analysis_complete and not selected.get("validation_exhausted", False)
-            for clip in selected["clips"]:
-                validate_clip(clip, unique, transcript["duration_sec"], settings)
-                start, end = unique[clip["start_id"]]["start"], unique[clip["end_id"]]["end"]
-                candidates.append({**clip, "start": start, "end": end, "status": "pending",
-                                   "format": "highlight",
-                                   "warnings": ["Проверьте завершённость мысли по исходной записи."],
-                                   "block_id": index})
+                if part_path.exists():
+                    selected = load_json(part_path)
+                else:
+                    selected = collect_clips(settings, build_clip(sentences), sentences, transcript["duration_sec"],
+                                             part_path.with_name(part_path.stem + "_attempts.json"), log,
+                                             f"Блок {index + 1}, часть {part_index + 1}")
+                    save_json(part_path, selected)
+                if not isinstance(selected, dict) or not isinstance(selected.get("clips"), list):
+                    raise ValueError(f"Повреждён кеш кандидатов: {part_path}")
+                analysis_warnings.extend(selected.get("selection_warnings", []))
+                analysis_complete = analysis_complete and not selected.get("validation_exhausted", False)
+                for clip in selected["clips"]:
+                    validate_clip(clip, unique, transcript["duration_sec"], settings)
+                    start, end = unique[clip["start_id"]]["start"], unique[clip["end_id"]]["end"]
+                    candidates.append({**clip, "start": start, "end": end, "status": "pending",
+                                       "format": "highlight",
+                                       "warnings": ["Проверьте завершённость мысли по исходной записи."],
+                                       "block_id": index})
+        except Exception as exc:
+            warning = f"PASS 2, блок {index + 1}: {exc}"
+            log(warning)
+            analysis_warnings.append(warning)
+            analysis_complete = False
     ranked = []
     for candidate in sorted(candidates, key=lambda c: c["score"], reverse=True):
         if not any(interval_iou(candidate, kept) >= 0.35 for kept in ranked):
@@ -375,10 +381,30 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
             break
     for index, candidate in enumerate(ranked, 1):
         candidate["candidate_id"] = f"c{index:03d}"
+
+    # --- Independent Shorts pass: separate catalog, cache namespace, and ranking ---
     from job_store import normalize_profiles
+    shorts_candidates = []
+    shorts_enabled = normalize_profiles(settings.get("outputs")).get("shorts", {}).get("enabled", True)
+    if shorts_enabled:
+        from shorts_selector import select_shorts
+        for index, block in enumerate(blocks):
+            log(f"PASS-Shorts: блок {index + 1}/{len(blocks)}")
+            shorts_selection = select_shorts(
+                block, transcript, settings,
+                job_dir / "analysis" / f"shorts_{window_signature}" / f"block_{index:04d}",
+                log)
+            analysis_warnings.extend(shorts_selection["warnings"])
+            analysis_complete = analysis_complete and shorts_selection["complete"]
+            shorts_candidates.extend(
+                dict(candidate, block_id=index) for candidate in shorts_selection["candidates"])
+        if shorts_candidates:
+            log(f"PASS-Shorts: найдено {len(shorts_candidates)} кандидатов на Shorts.")
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
               "profiles": normalize_profiles(settings.get("outputs")),
-              "signature": signature, "candidates": ranked, "context_policy_version": CONTEXT_POLICY_VERSION,
+              "signature": signature, "candidates": ranked,
+              "shorts_candidates": shorts_candidates,
+              "context_policy_version": CONTEXT_POLICY_VERSION,
               "analysis_warnings": analysis_warnings, "analysis_complete": analysis_complete,
               "selection_method": selection_method, "window_cache": str(window_cache.resolve())}
     save_json(report_path, report)
