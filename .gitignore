@@ -4,3 +4,6 @@ __pycache__/
 data/
 .pytest_cache/
 test_outputs/
+test_full_err.txt
+test_full_output.txt
+test_results.txt

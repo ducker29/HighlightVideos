@@ -390,14 +390,20 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
         from shorts_selector import select_shorts
         for index, block in enumerate(blocks):
             log(f"PASS-Shorts: блок {index + 1}/{len(blocks)}")
-            shorts_selection = select_shorts(
-                block, transcript, settings,
-                job_dir / "analysis" / f"shorts_{window_signature}" / f"block_{index:04d}",
-                log)
-            analysis_warnings.extend(shorts_selection["warnings"])
-            analysis_complete = analysis_complete and shorts_selection["complete"]
-            shorts_candidates.extend(
-                dict(candidate, block_id=index) for candidate in shorts_selection["candidates"])
+            try:
+                shorts_selection = select_shorts(
+                    block, transcript, settings,
+                    job_dir / "analysis" / f"shorts_{window_signature}" / f"block_{index:04d}",
+                    log)
+                analysis_warnings.extend(shorts_selection["warnings"])
+                analysis_complete = analysis_complete and shorts_selection["complete"]
+                shorts_candidates.extend(
+                    dict(candidate, block_id=index) for candidate in shorts_selection["candidates"])
+            except Exception as exc:
+                warning = f"PASS-Shorts, блок {index + 1}: {exc}"
+                log(warning)
+                analysis_warnings.append(warning)
+                analysis_complete = False
         if shorts_candidates:
             log(f"PASS-Shorts: найдено {len(shorts_candidates)} кандидатов на Shorts.")
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
