@@ -1,4 +1,5 @@
 """Clipboard/keyboard regressions without writing to the user's OS clipboard."""
+import os
 import sys
 import tkinter as tk
 from tkinter import ttk
@@ -8,6 +9,8 @@ from unittest.mock import patch
 
 from review_ui import HighlightApp
 from ui_editing import handle_edit_key, install_editing
+
+RUN_WINDOWS_CLIPBOARD_TESTS = os.environ.get("RUN_WINDOWS_CLIPBOARD_TESTS") == "1"
 
 
 class EditingTests(unittest.TestCase):
@@ -85,7 +88,10 @@ class EditingTests(unittest.TestCase):
             app.paste_url()
         self.assertEqual(app.variables["youtube_url"].get(), "existing URL")
 
-    @unittest.skipUnless(sys.platform == "win32", "Windows keyboard paste integration")
+    @unittest.skipUnless(
+        sys.platform == "win32" and RUN_WINDOWS_CLIPBOARD_TESTS,
+        "Windows clipboard integration (requires RUN_WINDOWS_CLIPBOARD_TESTS=1)"
+    )
     def test_real_clipboard_paste_reads_without_overwriting_clipboard(self):
         try:
             content = self.root.clipboard_get()

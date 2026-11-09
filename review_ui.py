@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 from analyzer import list_models
 from app_backend import open_report, run_analysis
 from job_store import DATA, ROOT, analysis_bounds, load_json, parse_time, save_json, timecode, validate_interval
-from renderer import approval_key, output_filename, render_approved
+from renderer import approval_key, output_filename, render_approved, render_shorts_approved, shorts_approval_key
 from clip_padding import padding_seconds, prepare_review_report, refresh_padding_overlaps, set_candidate_padding
 from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
@@ -131,7 +131,7 @@ class HighlightApp:
         self.button(actions, "Скачать и найти кандидатов", self.analyze, row=0, column=0, padx=(0, 8))
         self.button(actions, "Открыть сохранённый отчёт", self.load_report, row=0, column=1, padx=8)
         self.button(actions, "Нарезать утвержденные клипы", self.render, row=0, column=2, padx=8)
-        self.button(actions, "Рендер Shorts (Stage 6)", self.render_shorts, row=0, column=3, padx=8)
+        self.button(actions, "Рендер все Shorts", self.render_shorts, row=0, column=3, padx=8)
         self.button(actions, "Применить запас к отчёту", self.apply_end_padding,
                     row=0, column=4, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
@@ -667,12 +667,31 @@ class HighlightApp:
         self.start_worker("Финальная нарезка утверждённых интервалов…",
                           lambda: render_approved(manifest, report, job_dir, self.log, transcript=transcript))
 
-    def render_shorts(self):
-        """Рендер Shorts (заглушка для Stage 6)."""
-        messagebox.showinfo("Рендер Shorts",
-                            "Рендер Shorts 9:16 будет реализован в Stage 6.\n"
-                            "На данный момент доступна только редакторская проверка.",
-                            parent=self.root)
+    def render_shorts(self, candidate_id=None):
+        """Рендер утверждённых Shorts 9:16."""
+        if self.busy:
+            return
+        if not self.context:
+            messagebox.showinfo("Рендер Shorts", "Сначала откройте отчёт.", parent=self.root)
+            return
+        if self.has_unsaved_edits():
+            messagebox.showinfo("Ревью", "Сохраните правки выбранного кандидата.", parent=self.root)
+            return
+        report = copy.deepcopy(self.context["report"])
+        shorts = report.get("shorts_candidates", [])
+        if candidate_id is not None:
+            shorts = [c for c in shorts if c["candidate_id"] == candidate_id]
+        approved = [c for c in shorts if c["status"] == "approved"]
+        if not approved:
+            messagebox.showinfo("Рендер Shorts", "Сначала утвердите этот Short.", parent=self.root)
+            return
+        manifest = copy.deepcopy(self.context["manifest"])
+        job_dir = self.context["job_dir"]
+        transcript = copy.deepcopy(self.context["transcript"])
+        self.start_worker(
+            f"Рендер Shorts ({len(approved)} шт.)…",
+            lambda: render_shorts_approved(manifest, report, job_dir, self.log,
+                                            transcript=transcript, candidate_id=candidate_id))
 
     def preview(self):
         try:
@@ -834,7 +853,7 @@ class HighlightApp:
         self.shorts_table.selection_set(row)
         self.show_shorts_candidate()
         if column == "#8":  # Колонка "Рендер"
-            self.render_shorts()
+            self.render_shorts(candidate_id=row)
         return "break"
 
 
