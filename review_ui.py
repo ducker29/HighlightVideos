@@ -827,7 +827,7 @@ class HighlightApp:
             candidate["status"] = status
             candidate.pop("approval_key", None)
             if status == "approved":
-                candidate["approval_key"] = approval_key(candidate)
+                candidate["approval_key"] = shorts_approval_key(candidate)
             updated = copy.deepcopy(self.context["report"])
             updated["shorts_candidates"] = [
                 candidate if c["candidate_id"] == candidate["candidate_id"] else c
