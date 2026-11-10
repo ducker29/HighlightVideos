@@ -303,6 +303,79 @@ class TestPlaybackUpdates(unittest.TestCase):
         win._seek_to.assert_called_once_with(1.04)
 
 
+class TestPlaybackBackpressure(unittest.TestCase):
+    def _stub(self):
+        from unittest.mock import Mock
+        win = object.__new__(w.SmartCropWindow)
+        win.start = 857.68
+        win._seq = 0
+        win._frame_pending = False
+        win._playing = True
+        win._commands = queue.Queue()
+        win._render = Mock()
+        return win
+
+    def test_play_does_not_supersede_inflight_decode(self):
+        win = self._stub()
+        win._request_frame(1.0)
+        win._request_frame(1.04)
+        self.assertEqual(win._commands.qsize(), 1)
+        self.assertEqual(win._seq, 1)
+        w.SmartCropWindow._on_event(win, ("frame", 1, "frame1"))
+        win._render.assert_called_once_with("frame1")
+        self.assertFalse(win._frame_pending)
+        win._request_frame(1.08)
+        self.assertEqual(win._seq, 2)
+        self.assertAlmostEqual(win._commands.get_nowait()[2], 858.68)
+        self.assertAlmostEqual(win._commands.get_nowait()[2], 858.76)
+
+    def test_frame_step_supersedes_play_request(self):
+        win = self._stub()
+        win._request_frame(1.0)
+        win._playing = False
+        win._request_frame(2.0)
+        w.SmartCropWindow._on_event(win, ("frame", 1, "old"))
+        win._render.assert_not_called()
+        w.SmartCropWindow._on_event(win, ("frame", 2, "new"))
+        win._render.assert_called_once_with("new")
+        self.assertFalse(win._frame_pending)
+
+    def test_failed_decode_releases_pending_request(self):
+        win = self._stub()
+        win._request_frame(1.0)
+        w.SmartCropWindow._on_event(win, ("frame_failed", 1))
+        self.assertFalse(win._frame_pending)
+        win._request_frame(1.04)
+        self.assertEqual(win._seq, 2)
+
+
+class TestSequentialDecoder(unittest.TestCase):
+    def test_adjacent_frames_do_not_seek_again(self):
+        from unittest.mock import Mock, patch
+        from fractions import Fraction
+        import numpy as np
+        frames = []
+        for index in range(5):
+            frame = Mock()
+            frame.pts = index
+            frame.time_base = Fraction(1, 25)
+            frame.to_rgb.return_value.to_ndarray.return_value = np.full((2, 2, 3), index)
+            frames.append(frame)
+        stream = Mock()
+        stream.time_base = Fraction(1, 25)
+        container = Mock()
+        container.streams.video = [stream]
+        container.decode.side_effect = lambda **kwargs: iter(frames)
+        decoder = w.FrameDecoder("unused.mp4")
+        decoder._container = container
+        decoder.fps = 25.0
+        decoder.request_frame(0.04)
+        decoder.request_frame(0.08)
+        self.assertEqual(container.seek.call_count, 1)
+        self.assertEqual(decoder._last_frame_time, 0.08)
+
+
+
 # --------------------------------------------------------------------------- #
 # FrameDecoder
 # --------------------------------------------------------------------------- #

@@ -167,6 +167,9 @@ class FrameDecoder:
         self._container = None
         self.width = self.height = 0
         self.fps = 30.0
+        self._frames = None
+        self._last_frame_time = None
+        self._last_frame = None
 
     def is_closed(self):
         return self._closed
@@ -189,13 +192,34 @@ class FrameDecoder:
                 return None
             container = self._container
             stream = container.streams.video[0]
-            tb = _time_base_seconds(stream.time_base)
-            try:
-                container.seek(int(max(0.0, float(time_sec)) / tb), stream=stream)
-            except TypeError:  # older av builds don't accept a Stream object
-                container.seek(int(max(0.0, float(time_sec)) / tb))
-            for frame in container.decode(video=0):
-                return frame.to_rgb().to_ndarray()
+            target = max(0.0, float(time_sec))
+            tolerance = 0.5 / max(self.fps, 1.0)
+            # Consecutive playback frames use the existing decoder iterator.
+            # A random seek is needed only for backward or large jumps.
+            if (self._frames is None or self._last_frame_time is None
+                    or target < self._last_frame_time - tolerance
+                    or target - self._last_frame_time > 0.5):
+                tb = _time_base_seconds(stream.time_base)
+                offset = int(target / tb)
+                try:
+                    container.seek(offset, stream=stream, backward=True)
+                except TypeError:  # older PyAV
+                    container.seek(offset)
+                self._frames = iter(container.decode(video=0))
+                self._last_frame_time = None
+                self._last_frame = None
+            if (self._last_frame is not None and self._last_frame_time is not None
+                    and abs(target - self._last_frame_time) <= tolerance):
+                return self._last_frame
+            for frame in self._frames:
+                if frame.pts is None:
+                    continue
+                frame_time = float(frame.pts * (frame.time_base or stream.time_base))
+                if frame_time + tolerance < target:
+                    continue
+                self._last_frame_time = frame_time
+                self._last_frame = frame.to_rgb().to_ndarray()
+                return self._last_frame
         return None
 
     def close(self):
@@ -247,6 +271,7 @@ class SmartCropWindow(ttk.Frame):
         self._setting_slider = False
         self._programmatic_slider_value = None
         self._seq = 0
+        self._frame_pending = False
         self._closed = False
         self._source_image = None
         self._preview_image = None
@@ -414,14 +439,28 @@ class SmartCropWindow(ttk.Frame):
                     break
                 kind = item[0]
                 if kind == "get_frame":
+                    # Keep the newest seek; do not spend seconds decoding old
+                    # positions after a fast scrub or repeated frame stepping.
                     _, seq, t = item
+                    while True:
+                        try:
+                            newer = self._commands.get_nowait()
+                        except queue.Empty:
+                            break
+                        if newer is None:
+                            return
+                        if newer[0] == "get_frame":
+                            _, seq, t = newer
                     try:
                         arr = decoder.request_frame(t, seq=seq)
                     except Exception as exc:
                         self._events.put(("error", f"ошибка декодирования: {exc}"))
+                        self._events.put(("frame_failed", seq))
                         continue
                     if arr is not None:
                         self._events.put(("frame", seq, arr))
+                    else:
+                        self._events.put(("frame_failed", seq))
         finally:
             decoder.close()
 
@@ -454,7 +493,11 @@ class SmartCropWindow(ttk.Frame):
             _, seq, arr = event
             if seq < self._seq:  # stale frame from a superseded request
                 return
+            self._frame_pending = False
             self._render(arr)
+        elif kind == "frame_failed":
+            if event[1] == self._seq:
+                self._frame_pending = False
         elif kind == "error":
             self.info_label.configure(text=event[1])
 
@@ -467,7 +510,13 @@ class SmartCropWindow(ttk.Frame):
         уже абсолютное. Ползунок/Play/Pause/таймкод/покадрово работают в
         локальном времени и сюда стекаются только через этот метод.
         """
+        # While playing, allow one decode in flight. Otherwise a slow 4K
+        # decode is *always* stale by the time the next 40 ms tick arrives.
+        # Paused seeks and frame-step commands must still supersede it.
+        if self._playing and self._frame_pending:
+            return
         self._seq += 1
+        self._frame_pending = True
         self._commands.put(("get_frame", self._seq, local_to_absolute(t, self.start)))
 
     def _advance_playback(self):
