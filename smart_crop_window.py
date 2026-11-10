@@ -66,6 +66,26 @@ def segment_for(settings, time):
     return settings["segments"][index] if index >= 0 else None
 
 
+def timeline_segment_at(segments, duration, x_px, canvas_width):
+    """Map a horizontal pixel coordinate to a segment index on the timeline.
+
+    ``segments`` is a list of dicts with numeric ``start``/``end`` in local
+    Short time; ``duration`` is the total Short duration. Returns -1 when the
+    coordinate falls outside the drawn timeline. Pure geometry: no validation,
+    no copying of settings.
+    """
+    if canvas_width <= 0 or duration <= 0:
+        return -1
+    x = float(x_px)
+    if x < 0 or x > canvas_width:
+        return -1
+    time = min(max(x / canvas_width, 0.0), 1.0) * duration
+    for i, seg in enumerate(segments):
+        if seg["start"] <= time < seg["end"] or (i == len(segments) - 1 and abs(time - seg["end"]) < 1e-6):
+            return i
+    return -1
+
+
 def display_geometry(fw, fh, max_w, max_h):
     """Centered display geometry of an (fw, fh) frame inside (max_w, max_h).
 
@@ -244,6 +264,7 @@ PREVIEW_W = 300
 PREVIEW_H = 533
 POLL_MS = 40
 MAX_DECODE_PIXELS = 1024 * 1024  # decode at most ~1M pixels per frame (~1024x1024)
+TIMELINE_H = 44
 
 
 class SmartCropWindow(ttk.Frame):
@@ -288,6 +309,8 @@ class SmartCropWindow(ttk.Frame):
         self._crop_rect_id = None
         self._crop_label = None
         self._shown_segment_index = None
+        self._selected_segment = 0
+        self._timeline_rect_ids = None
 
         if own_toplevel or master is None:
             self.toplevel = tk.Toplevel()
@@ -358,6 +381,13 @@ class SmartCropWindow(ttk.Frame):
         self.time_label = ttk.Label(bottom, text="00:00:00.000")
         self.time_label.pack(side="left")
 
+        self.timeline_canvas = tk.Canvas(self, height=TIMELINE_H, bg="#1a1a1a",
+                                         highlightthickness=0)
+        self.timeline_canvas.pack(fill="x", padx=8, pady=(0, 4))
+        self.timeline_canvas.bind("<ButtonPress-1>", self._on_timeline_click)
+        self.timeline_canvas.bind("<Configure>", lambda _e: self._draw_timeline())
+        self._draw_timeline()
+
     # -- playback state --------------------------------------------------- #
     def _current_time(self):
         return float(self.slider.get())
@@ -398,7 +428,9 @@ class SmartCropWindow(ttk.Frame):
                 self._apply_crop_from_settings()
                 self._update_crop_label()
             self._shown_segment_index = index
+            self._selected_segment = index
         self._request_frame(t)
+        self._update_timeline()
 
     def _set_time(self, t):
         """Update timeline, timecode and frame without treating it as a user seek."""
@@ -775,6 +807,77 @@ class SmartCropWindow(ttk.Frame):
             self._redraw_source()
             self._apply_crop_from_settings()
         self._refresh_preview()
+        self._update_timeline()
+
+    # -- segment timeline ------------------------------------------------- #
+    def _timeline_segment_index(self, time):
+        """Segment index at local ``time`` from the (already validated) settings.
+
+        No full re-validation: segments are sorted, non-overlapping, and cover
+        [0, duration], so a plain scan is enough.
+        """
+        segments = self.settings["segments"]
+        n = len(segments)
+        if not segments or time < 0 or time > self.duration + 1e-6:
+            return -1
+        for i, seg in enumerate(segments):
+            if seg["start"] <= time < seg["end"] or (i == n - 1 and time <= seg["end"] + 1e-6):
+                return i
+        return -1
+
+    def _draw_timeline(self):
+        """Redraw the segment strip and the playhead."""
+        canvas = self.timeline_canvas
+        canvas.delete("all")
+        width = max(1, int(canvas.winfo_width()))
+        height = TIMELINE_H
+        canvas.configure(width=width, height=height)
+        segments = self.settings["segments"]
+        duration = self.duration
+        rect_ids = []
+        for i, seg in enumerate(segments):
+            x1 = seg["start"] / duration * width
+            x2 = seg["end"] / duration * width
+            if i == self._selected_segment:
+                fill = "#2d6ca3"
+                outline = "#ffffff"
+            else:
+                fill = "#262626"
+                outline = "#444444"
+            rect = canvas.create_rectangle(x1, 2, x2, height - 2, fill=fill,
+                                           outline=outline, width=1)
+            rect_ids.append(rect)
+            if x2 - x1 > 18:
+                canvas.create_text((x1 + x2) / 2, height / 2, text=str(i + 1),
+                                   fill="#ffffff")
+        self._timeline_rect_ids = rect_ids
+        t = float(self.slider.get())
+        px = min(max(t / duration, 0.0), 1.0) * width
+        canvas.create_line(px, 0, px, height, fill="#ff5555", width=2,
+                           tags="playhead")
+
+    def _update_timeline(self):
+        """Move the playhead without re-validating settings."""
+        width = max(1, int(self.timeline_canvas.winfo_width()))
+        height = TIMELINE_H
+        duration = self.duration
+        t = float(self.slider.get())
+        px = min(max(t / duration, 0.0), 1.0) * width
+        ids = self.timeline_canvas.find_withtag("playhead")
+        if ids:
+            self.timeline_canvas.coords(ids[-1], px, 0, px, height)
+
+    def _on_timeline_click(self, event):
+        width = max(1, int(self.timeline_canvas.winfo_width()))
+        index = timeline_segment_at(
+            self.settings["segments"], self.duration, event.x, width)
+        if index < 0:
+            return
+        seg = self.settings["segments"][index]
+        self._selected_segment = index
+        self._playing = False
+        self.play_btn.configure(text="▶ Play")
+        self._set_time(seg["start"])
 
     # -- lifecycle -------------------------------------------------------- #
     def close(self):

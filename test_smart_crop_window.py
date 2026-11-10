@@ -3,6 +3,7 @@
 Non-GUI tests run headless (geometry, segment lookup, decoder lifecycle).
 Tkinter GUI tests require a display and are skipped when none is available.
 """
+import json
 import queue
 import shutil
 import subprocess
@@ -253,6 +254,44 @@ class TestTimeConversion(unittest.TestCase):
         # A box dragged above the image is pushed down to the image top.
         x2, y2, _, _ = w.clamp_box_in_area(10, -50, 100, 100, (cx, cy, dw, dh, 1.0))
         self.assertEqual(y2, cy)
+
+
+# --------------------------------------------------------------------------- #
+# timeline_segment_at (pure geometry, headless)
+# --------------------------------------------------------------------------- #
+class TestTimelineSegmentAt(unittest.TestCase):
+    """Click-coordinate -> segment index mapping for the timeline canvas."""
+
+    def test_single_segment_spans_full_timeline(self):
+        segments = [{"start": 0.0, "end": 10.0}]
+        # A single segment occupies the whole strip; any inner x maps to it.
+        for x in (0, 25, 50, 75, 99):
+            self.assertEqual(w.timeline_segment_at(segments, 10.0, x, 100), 0)
+        # The very end maps to the (only) last segment.
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 100, 100), 0)
+
+    def test_multiple_segments_proportional_to_duration(self):
+        # 0-4s (40%), 4-10s (60%): 40% of a 100px strip = 40px.
+        segments = [{"start": 0.0, "end": 4.0}, {"start": 4.0, "end": 10.0}]
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 39, 100), 0)
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 41, 100), 1)
+        # Right edge belongs to the last segment.
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 99, 100), 1)
+
+    def test_boundary_belongs_to_right_segment(self):
+        segments = [{"start": 0.0, "end": 5.0}, {"start": 5.0, "end": 10.0}]
+        # x=50 == 5.0s: the right segment owns the boundary.
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 50, 100), 1)
+
+    def test_outside_canvas_returns_minus_one(self):
+        segments = [{"start": 0.0, "end": 10.0}]
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, -1, 100), -1)
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 101, 100), -1)
+
+    def test_degenerate_canvas_or_duration(self):
+        segments = [{"start": 0.0, "end": 10.0}]
+        self.assertEqual(w.timeline_segment_at(segments, 10.0, 50, 0), -1)
+        self.assertEqual(w.timeline_segment_at(segments, 0.0, 50, 100), -1)
 
 
 # --------------------------------------------------------------------------- #
@@ -779,6 +818,109 @@ class TestSmartCropWindowGUI(unittest.TestCase):
             cx, _, _, _, _ = win._source_display
             self.assertAlmostEqual(x, cx, places=3,
                                    msg="saved crop x=0 must remain at the frame's left edge")
+        finally:
+            win.close()
+
+
+# --------------------------------------------------------------------------- #
+# Segment timeline GUI (require a display)
+# --------------------------------------------------------------------------- #
+@unittest.skipUnless(_display_available(), "Tkinter display required")
+class TestTimelineGUI(unittest.TestCase):
+    def _build(self, end=2.0, segments=None):
+        import tkinter as tk
+        from smart_crop_storage import create_settings
+        tmp = tempfile.TemporaryDirectory()
+        src = Path(tmp.name) / "src.mp4"
+        _make_video(src)
+        self.addCleanup(tmp.cleanup)
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        settings = create_settings("c1", 0.0, end, 1280, 720)
+        if segments is not None:
+            settings["segments"] = [
+                {"start": s["start"], "end": s["end"],
+                 "shot_type": "UNKNOWN", "target": "AUTO",
+                 "crop": {"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0},
+                 "manual_override": False}
+                for s in segments]
+        win = w.SmartCropWindow(root, src, 0.0, end, "c1", settings)
+        return root, win
+
+    def test_single_segment_spans_full_width(self):
+        root, win = self._build()
+        try:
+            width = max(1, int(win.timeline_canvas.winfo_width()))
+            root.update()
+            width = max(1, int(win.timeline_canvas.winfo_width()))
+            win._draw_timeline()
+            rects = win.timeline_canvas.find_withtag("all")
+            # One rectangle + one playhead line = 2 items (label hidden if <18px).
+            self.assertEqual(len(win._timeline_rect_ids), 1)
+            x1, y1, x2, y2 = win.timeline_canvas.coords(win._timeline_rect_ids[0])
+            self.assertLessEqual(x1, 1e-6)
+            self.assertAlmostEqual(x2, width, delta=1e-6,
+                                   msg="single segment must fill the whole timeline")
+        finally:
+            win.close()
+
+    def test_multiple_segments_proportional(self):
+        # 0-1s, 1-2s on a 2s Short: first segment is exactly half the strip.
+        root, win = self._build(end=2.0, segments=[
+            {"start": 0.0, "end": 1.0}, {"start": 1.0, "end": 2.0}])
+        try:
+            root.update()
+            win._draw_timeline()
+            width = max(1, int(win.timeline_canvas.winfo_width()))
+            x1, _, x2, _ = win.timeline_canvas.coords(win._timeline_rect_ids[0])
+            self.assertAlmostEqual(x2 - x1, width / 2, delta=1.0,
+                                   msg="segment width must be proportional to duration")
+        finally:
+            win.close()
+
+    def test_click_selects_correct_segment(self):
+        root, win = self._build(end=2.0, segments=[
+            {"start": 0.0, "end": 0.5}, {"start": 0.5, "end": 2.0}])
+        try:
+            root.update()
+            win._draw_timeline()
+            width = max(1, int(win.timeline_canvas.winfo_width()))
+            # A withdrawn canvas may have width 1: force a realistic size so the
+            # click coordinate falls inside the second segment (x = 0.75 * 200 = 150
+            # -> 1.5s on a 2s Short).
+            win.timeline_canvas.winfo_width = lambda: 200
+            # Re-draw at the new size and verify the click handler reads it.
+            win._draw_timeline()
+            win._on_timeline_click(type("E", (), {"x": 150})())
+            self.assertEqual(win._selected_segment, 1)
+            self.assertAlmostEqual(win._current_time(), 0.5, places=4,
+                                   msg="click must seek to the segment start")
+        finally:
+            win.close()
+
+    def test_playhead_does_not_modify_settings(self):
+        root, win = self._build()
+        try:
+            before = json.dumps(win.settings, sort_keys=True)
+            win._set_time(0.7)
+            win._set_time(1.3)
+            win._draw_timeline()
+            self.assertEqual(json.dumps(win.settings, sort_keys=True), before)
+        finally:
+            win.close()
+
+    def test_resize_redraw_keeps_segments(self):
+        root, win = self._build(end=2.0, segments=[
+            {"start": 0.0, "end": 1.0}, {"start": 1.0, "end": 2.0}])
+        try:
+            root.update()
+            before = json.dumps(win.settings["segments"], sort_keys=True)
+            # Simulate a window/canvas resize and redraw.
+            win.timeline_canvas.winfo_width = lambda: 420
+            win._draw_timeline()
+            self.assertEqual(json.dumps(win.settings["segments"], sort_keys=True), before)
+            self.assertEqual(len(win._timeline_rect_ids), 2)
         finally:
             win.close()
 
