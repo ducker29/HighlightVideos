@@ -16,6 +16,7 @@ from renderer import approval_key, output_filename, render_approved, render_shor
 from clip_padding import padding_seconds, prepare_review_report, refresh_padding_overlaps, set_candidate_padding
 from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
+from smart_crop_storage import create_settings, load_settings, settings_path
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -132,10 +133,11 @@ class HighlightApp:
         self.button(actions, "Открыть сохранённый отчёт", self.load_report, row=0, column=1, padx=8)
         self.button(actions, "Нарезать утвержденные клипы", self.render, row=0, column=2, padx=8)
         self.button(actions, "Рендер все Shorts", self.render_shorts, row=0, column=3, padx=8)
+        self.button(actions, "Смарт-кроп", self.open_smart_crop, row=0, column=4, padx=8)
         self.button(actions, "Применить запас к отчёту", self.apply_end_padding,
-                    row=0, column=4, padx=8)
+                    row=0, column=5, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
-        self.progress.grid(row=0, column=5, padx=8)
+        self.progress.grid(row=0, column=6, padx=8)
         ttk.Label(outer, textvariable=self.status, wraplength=1180).pack(fill="x", pady=(0, 5))
 
         panes = ttk.Panedwindow(outer, orient="vertical")
@@ -854,6 +856,59 @@ class HighlightApp:
         if column == "#8":  # Колонка "Рендер"
             self.render_shorts(candidate_id=row)
         return "break"
+
+    def open_smart_crop(self):
+        """Открывает окно умного кропа для выбранного Shorts-кандидата."""
+        if self.busy:
+            return
+        if not self.context:
+            messagebox.showinfo("Смарт-кроп", "Сначала откройте отчёт.", parent=self.root)
+            return
+        candidate = self.current_shorts_candidate()
+        if not candidate:
+            messagebox.showinfo("Смарт-кроп", "Выберите Shorts-кандидата во вкладке Shorts.", parent=self.root)
+            return
+        # Предотвращаем повторное открытие окна для того же кандидата.
+        for window in self.root.winfo_children():
+            if isinstance(window, tk.Toplevel) and getattr(window, "smart_crop_candidate_id", None) == candidate["candidate_id"] and window.winfo_exists():
+                messagebox.showinfo("Смарт-кроп", "Для этого Shorts окно умного кропа уже открыто.", parent=self.root)
+                window.deiconify()
+                window.lift()
+                return
+        try:
+            source_path = Path(self.context["manifest"]["source_path"])
+            if not source_path.exists():
+                raise FileNotFoundError(f"Не найден исходник: {source_path}")
+            media = self.context["manifest"]["media"]
+            job_dir = Path(self.context["job_dir"])
+            signature = self.context["report"].get("signature") or self.context["report_path"].parent.name
+            path = settings_path(job_dir, signature, candidate["candidate_id"])
+            if path.exists():
+                settings, _warnings = load_settings(path)
+            else:
+                settings = create_settings(candidate["candidate_id"], candidate["start"], candidate["end"],
+                                           media["width"], media["height"])
+            start = float(candidate["start"])
+            end = float(candidate["end"])
+            top = tk.Toplevel(self.root)
+            top.title(f"Смарт-кроп — {candidate['candidate_id']}")
+            top.geometry("1180x760")
+            top.transient(self.root)
+            frame = ttk.Frame(top, padding=6)
+            frame.pack(fill="both", expand=True)
+            from smart_crop_window import SmartCropWindow
+            editor = SmartCropWindow(frame, source_path, start, end,
+                                     candidate["candidate_id"], settings, own_toplevel=False)
+            editor.pack(fill="both", expand=True)
+            top.smart_crop_candidate_id = candidate["candidate_id"]
+            top.smart_crop_settings = settings
+            top.smart_crop_frame = frame
+            top.smart_crop_editor = editor
+        except Exception as exc:
+            for w in self.root.winfo_children():
+                if isinstance(w, tk.Toplevel) and not w.winfo_exists():
+                    w.destroy()
+            messagebox.showerror("Смарт-кроп", f"Не удалось открыть окно умного кропа:\n{exc}", parent=self.root)
 
 
 def main(report_path=None):

@@ -347,5 +347,300 @@ class ShortsRenderSelectionTests(unittest.TestCase):
         self.assertTrue(app.busy)
 
 
+class SmartCropButtonTests(unittest.TestCase):
+    """Проверка кнопки «Смарт-кроп» и логики open_smart_crop."""
+
+    def _make_app(self):
+        import tkinter as tk
+        from review_ui import HighlightApp
+
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        app = HighlightApp(root)
+        app.context = {
+            "job_dir": str(ROOT / "data" / "test_vid"),
+            "manifest": {
+                "video_id": "test_vid",
+                "media": {"duration_sec": 300.0},
+                "source_path": "D:/nonexistent/smart_crop_test_source.mp4",
+            },
+            "report": {
+                "schema": 1,
+                "video_id": "test_vid",
+                "signature": "sig",
+                "settings": {},
+                "candidates": [],
+                "shorts_candidates": [
+                    {"candidate_id": "s001", "start": 100, "end": 140, "score": 9,
+                     "title": "Short 1", "reason": "r", "status": "approved"},
+                ],
+            },
+            "report_path": DATA / "test_vid" / "analysis" / "sig" / "report.json",
+            "transcript": {"sentences": []},
+            "quality_notes": {},
+        }
+        return root, app
+
+    def test_button_exists(self):
+        """Кнопка «Смарт-кроп» должна существовать на панели действий."""
+        root, app = self._make_app()
+        try:
+            self.assertTrue(hasattr(app, "open_smart_crop"))
+            # Кнопка добавлена в actions: ищем по тексту.
+            def find_button(widget):
+                if isinstance(widget, __import__("tkinter").ttk.Button) and \
+                   widget.cget("text") == "Смарт-кроп":
+                    return widget
+                for child in widget.winfo_children():
+                    found = find_button(child)
+                    if found is not None:
+                        return found
+                return None
+            self.assertIsNotNone(find_button(app.root), "кнопка «Смарт-кроп» не найдена в UI")
+        finally:
+            root.destroy()
+
+    def test_no_context_shows_message(self):
+        """Без открытого отчёта окно не создаётся, показывается сообщение."""
+        import tkinter as tk
+        from unittest.mock import patch
+
+        root, app = self._make_app()
+        app.context = None
+        try:
+            with patch("review_ui.messagebox") as mb:
+                app.open_smart_crop()
+            mb.showinfo.assert_called_once()
+        finally:
+            root.destroy()
+
+    def test_no_candidate_shows_message(self):
+        """Без выбранного Shorts-кандидата окно не создаётся."""
+        from unittest.mock import patch
+
+        root, app = self._make_app()
+        # Снимаем выделение с таблицы.
+        app.shorts_table.selection_remove(app.shorts_table.selection())
+        try:
+            with patch("review_ui.messagebox") as mb:
+                app.open_smart_crop()
+            mb.showinfo.assert_called_once()
+        finally:
+            root.destroy()
+
+    def test_source_not_found_no_window(self):
+        """Если исходный файл отсутствует, окно не создаётся (ошибка перехватывается)."""
+        from unittest.mock import patch
+
+        root, app = self._make_app()
+        app.context["manifest"]["source_path"] = str(ROOT / "data" / "test_vid" / "missing.mp4")
+        import tkinter as tk
+        top_before = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+        try:
+            with patch("review_ui.messagebox"):
+                app.open_smart_crop()
+            top_after = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+            self.assertEqual(len(top_after), len(top_before), "окно не должно создаваться при отсутствии исходника")
+        finally:
+            root.destroy()
+
+    def test_busy_does_nothing(self):
+        """При busy окно не создаётся и сообщений нет."""
+        from unittest.mock import patch
+
+        root, app = self._make_app()
+        app.busy = True
+        try:
+            with patch("review_ui.messagebox") as mb:
+                app.open_smart_crop()
+            mb.assert_not_called()
+        finally:
+            root.destroy()
+
+    def test_editor_is_packed_in_toplevel(self):
+        """Регрессионный: после open_smart_crop контейнер редактора размещён внутри Toplevel."""
+        import os
+        import tempfile
+        import tkinter as tk
+
+        root, app = self._make_app()
+        # Создаём реальный файл-заглушку, чтобы прошёл check source_path.exists()
+        fd, tmp_src = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        try:
+            app.context["manifest"]["source_path"] = tmp_src
+            app.context["manifest"]["media"]["width"] = 1920
+            app.context["manifest"]["media"]["height"] = 1080
+            # Заполняем таблицу и выделяем кандидата
+            app.refresh_shorts_table("s001")
+
+            tops_before = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel) and w.winfo_exists()]
+            app.open_smart_crop()
+
+            tops_after = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel) and w.winfo_exists()]
+            self.assertGreater(len(tops_after), len(tops_before), "Toplevel не создан")
+
+            top = tops_after[-1]
+            editor = getattr(top, "smart_crop_editor", None)
+            self.assertIsNotNone(editor, "top.smart_crop_editor не установлен")
+
+            # Проверяем, что editor является потомком top (прямой или косвенный)
+            def find_ancestor(widget):
+                master = widget.master
+                while master is not None:
+                    if master is top:
+                        return True
+                    master = master.master
+                return False
+
+            self.assertTrue(find_ancestor(editor), "editor не является потомком Toplevel")
+
+            # Проверяем, что editor реально размещён (pack/grid)
+            # Если pack() не вызывался, winfo_children() родителя не будет включать editor
+            parent_frame = editor.master
+            children = parent_frame.winfo_children()
+            self.assertIn(editor, children, "editor не найден среди потомков контейнера — pack()/grid() не вызывался")
+        finally:
+            root.destroy()
+            if os.path.exists(tmp_src):
+                os.remove(tmp_src)
+
+
+class SmartCropSliderRecursionTests(unittest.TestCase):
+    """Регрессионные тесты: программное _set_time не вызывает рекурсию через slider callback."""
+
+    @staticmethod
+    def _settings():
+        from smart_crop_storage import create_settings
+        return create_settings("s001", 857.68, 901.40, 3840, 2160)
+
+    def test_programmatic_set_time_no_recursion(self):
+        """_set_time(10.0) не вызывает RecursionError (slider.set → _on_slider → _seek_to)."""
+        import tkinter as tk
+        from smart_crop_window import SmartCropWindow
+
+        root = tk.Tk()
+        root.withdraw()
+        win = SmartCropWindow(root, source_path="dummy.mp4", start=857.68, end=901.40,
+                              candidate_id="s001", settings=self._settings())
+        try:
+            # This must not raise RecursionError
+            win._set_time(10.0)
+            root.update_idletasks()
+            root.update()
+        finally:
+            root.destroy()
+
+    def test_initial_load_requests_first_frame(self):
+        """При создании окна отправляется ровно один запрос кадра (t=0.0).
+
+        __init__ сначала программно обновляет ползунок (без запроса), затем
+        явно отправляет первый запрос через _seek_to(0.0).
+        """
+        import tkinter as tk
+        from smart_crop_window import SmartCropWindow
+
+        root = tk.Tk()
+        root.withdraw()
+        win = SmartCropWindow(root, source_path="dummy.mp4", start=857.68, end=901.40,
+                              candidate_id="s001", settings=self._settings())
+        try:
+            # _set_time(0.0) не создаёт запрос; один запрос идёт из _seek_to(0.0).
+            self.assertEqual(win._seq, 1, "один запрос кадра при инициализации")
+            # The command queue should contain exactly one get_frame request
+            item = win._commands.get_nowait()
+            self.assertEqual(item[0], "get_frame")
+            self.assertEqual(item[1], 1)
+            self.assertAlmostEqual(item[2], 0.0)
+        finally:
+            root.destroy()
+
+    def test_slider_drag_requests_frame(self):
+        """Перемещение ползунка запрашивает кадр (один запрос на один seek)."""
+        import tkinter as tk
+        from smart_crop_window import SmartCropWindow
+
+        root = tk.Tk()
+        root.withdraw()
+        win = SmartCropWindow(root, source_path="dummy.mp4", start=857.68, end=901.40,
+                              candidate_id="s001", settings=self._settings())
+        try:
+            # Drain the initial frame request
+            initial = win._commands.get_nowait()
+            self.assertEqual(initial[0], "get_frame")
+            initial_seq = win._seq
+
+            # Simulate user dragging slider
+            win._on_slider(20.0)
+            root.update_idletasks()
+            root.update()
+
+            self.assertEqual(win._seq, initial_seq + 1, "один запрос кадра после seek")
+            item = win._commands.get_nowait()
+            self.assertEqual(item[0], "get_frame")
+            self.assertEqual(item[1], initial_seq + 1)
+            self.assertAlmostEqual(item[2], 20.0)
+        finally:
+            root.destroy()
+
+    def test_rapid_seeks_bounded_queue(self):
+        """Быстрые seek не создают бесконечную очередь: N seeks → N новых запросов."""
+        import tkinter as tk
+        from smart_crop_window import SmartCropWindow
+
+        root = tk.Tk()
+        root.withdraw()
+        win = SmartCropWindow(root, source_path="dummy.mp4", start=857.68, end=901.40,
+                              candidate_id="s001", settings=self._settings())
+        try:
+            # Drain initial
+            win._commands.get_nowait()
+            base_seq = win._seq
+
+            n_seeks = 5
+            for i in range(n_seeks):
+                win._on_slider(float(i * 1.0))
+                root.update_idletasks()
+                root.update()
+
+            self.assertEqual(win._seq, base_seq + n_seeks,
+                             f"ожидается {base_seq + n_seeks}, получено {win._seq}")
+            # Queue should have exactly n_seeks get_frame items
+            count = 0
+            while not win._commands.empty():
+                item = win._commands.get_nowait()
+                if item[0] == "get_frame":
+                    count += 1
+            self.assertEqual(count, n_seeks,
+                             f"в очереди {count} запросов, ожидалось {n_seeks}")
+        finally:
+            root.destroy()
+
+    def test_set_time_does_not_double_request(self):
+        """_set_time (программное обновление ползунка) не создаёт запросов кадров."""
+        import tkinter as tk
+        from smart_crop_window import SmartCropWindow
+
+        root = tk.Tk()
+        root.withdraw()
+        win = SmartCropWindow(root, source_path="dummy.mp4", start=857.68, end=901.40,
+                              candidate_id="s001", settings=self._settings())
+        try:
+            win._commands.get_nowait()  # drain initial
+            base_seq = win._seq
+
+            win._set_time(5.0)
+            root.update_idletasks()
+            root.update()
+
+            # _set_time — чистый программный set ползунка: новых запросов нет.
+            self.assertEqual(win._seq, base_seq,
+                             f"_set_time не должен создавать запросы, "
+                             f"получено {win._seq - base_seq} новых")
+        finally:
+            root.destroy()
+
+
 if __name__ == "__main__":
     unittest.main()
