@@ -244,6 +244,8 @@ class SmartCropWindow(ttk.Frame):
         self._worker = None
         self._decoder = None
         self._playing = False
+        self._setting_slider = False
+        self._programmatic_slider_value = None
         self._seq = 0
         self._closed = False
         self._source_image = None
@@ -347,6 +349,14 @@ class SmartCropWindow(ttk.Frame):
         self._set_time(t)
 
     def _on_slider(self, value):
+        # Ignore callbacks caused by programmatic Scale updates.
+        if self._setting_slider:
+            return
+        if self._programmatic_slider_value is not None:
+            expected = self._programmatic_slider_value
+            self._programmatic_slider_value = None
+            if abs(float(value) - expected) < 1e-6:
+                return
         # Пользовательский seek: вызывается только Tk при перемещении мышью.
         self._playing = False
         self.play_btn.configure(text="▶ Play")
@@ -366,10 +376,15 @@ class SmartCropWindow(ttk.Frame):
         self._request_frame(t)
 
     def _set_time(self, t):
-        """Программное обновление ползунка; кадр НЕ запрашивает."""
+        """Update timeline, timecode and frame without treating it as a user seek."""
         t = max(0.0, min(self.duration, t))
-        # configure не вызывает command callback, в отличие от set()
-        self.slider.configure(value=t)
+        self._programmatic_slider_value = t
+        self._setting_slider = True
+        try:
+            self.slider.set(t)
+        finally:
+            self._setting_slider = False
+        self._seek_to(t)
 
     def _update_time_label(self, t):
         self.time_label.configure(text=timecode(t))

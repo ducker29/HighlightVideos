@@ -256,6 +256,54 @@ class TestTimeConversion(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Playback regression (no Tk display required)
+# --------------------------------------------------------------------------- #
+class TestPlaybackUpdates(unittest.TestCase):
+    def _window_stub(self):
+        from unittest.mock import Mock
+        win = object.__new__(w.SmartCropWindow)
+        win.duration = 10.0
+        win._playing = True
+        win._closed = False
+        win._setting_slider = False
+        win._programmatic_slider_value = None
+        win.slider = Mock()
+        win.slider.get.return_value = 1.0
+        win.play_btn = Mock()
+        win._seek_to = Mock()
+        return win
+
+    def test_play_advances_slider_and_requests_frame_and_timecode(self):
+        win = self._window_stub()
+        win._advance_playback()
+        expected = 1.0 + w.POLL_MS / 1000.0
+        win.slider.set.assert_called_once_with(expected)
+        win._seek_to.assert_called_once_with(expected)
+        self.assertTrue(win._playing)
+
+    def test_programmatic_slider_callback_does_not_pause(self):
+        win = self._window_stub()
+        win._set_time(2.0)
+        win._on_slider("2.0")
+        self.assertTrue(win._playing)
+        win._seek_to.assert_called_once_with(2.0)
+
+    def test_user_slider_callback_still_seeks_and_pauses(self):
+        win = self._window_stub()
+        win._set_time(2.0)
+        win._on_slider("3.0")
+        self.assertFalse(win._playing)
+        win._seek_to.assert_called_with(3.0)
+
+    def test_step_frame_requests_new_frame(self):
+        win = self._window_stub()
+        win.fps = 25.0
+        win.step_frame(1)
+        self.assertFalse(win._playing)
+        win._seek_to.assert_called_once_with(1.04)
+
+
+# --------------------------------------------------------------------------- #
 # FrameDecoder
 # --------------------------------------------------------------------------- #
 def _make_video(path, w=1280, h=720, fps=25, duration=2):
