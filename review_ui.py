@@ -16,7 +16,7 @@ from renderer import approval_key, output_filename, render_approved, render_shor
 from clip_padding import padding_seconds, prepare_review_report, refresh_padding_overlaps, set_candidate_padding
 from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
-from smart_crop_storage import create_settings, load_settings, settings_path
+from smart_crop_storage import create_settings, load_settings, save_settings, settings_path
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -904,12 +904,27 @@ class HighlightApp:
             top.smart_crop_settings = settings
             top.smart_crop_frame = frame
             top.smart_crop_editor = editor
+            top.smart_crop_save_path = path
+            top.protocol("WM_DELETE_WINDOW", lambda w=top, p=path, e=editor: self._close_smart_crop(w, p, e))
         except Exception as exc:
             for w in self.root.winfo_children():
                 if isinstance(w, tk.Toplevel) and not w.winfo_exists():
                     w.destroy()
             messagebox.showerror("Смарт-кроп", f"Не удалось открыть окно умного кропа:\n{exc}", parent=self.root)
 
+    def _close_smart_crop(self, window, path, editor):
+        """Сохранить settings, остановить декодер и уничтожить Toplevel."""
+        try:
+            save_settings(editor.settings, path)
+        except Exception as exc:
+            if not messagebox.askokcancel("Смарт-кроп", f"Не удалось сохранить Smart Crop:\n{exc}", parent=self.root):
+                return
+        editor.close()
+        try:
+            if window.winfo_exists():
+                window.destroy()
+        except Exception:
+            pass
 
 def main(report_path=None):
     root = tk.Tk()

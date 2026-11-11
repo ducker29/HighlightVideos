@@ -14,8 +14,9 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
+from tkinter import messagebox
 
-from smart_crop_storage import segment_at, set_segment_crop
+from smart_crop_storage import segment_at, set_segment_crop, split_segment
 from job_store import timecode
 
 try:
@@ -372,6 +373,7 @@ class SmartCropWindow(ttk.Frame):
         ttk.Button(btns, text="⏮ кадр", command=lambda: self.step_frame(-1)).pack(side="left", padx=2)
         ttk.Button(btns, text="кадр ⏭", command=lambda: self.step_frame(1)).pack(side="left", padx=2)
         ttk.Button(btns, text="Сбросить crop", command=self.reset_crop).pack(side="left", padx=2)
+        ttk.Button(btns, text="Разделить", command=self.split_current_segment).pack(side="left", padx=2)
         self.crop_label = ttk.Label(btns, text="")
         self.crop_label.pack(side="left", padx=(8, 2))
 
@@ -786,6 +788,35 @@ class SmartCropWindow(ttk.Frame):
         self._apply_crop_from_settings()
         self._update_crop_label()
         self._refresh_preview()
+
+    def split_current_segment(self):
+        """Разделить текущий сегмент по позиции playhead'а."""
+        self._playing = False
+        self.play_btn.configure(text="▶ Play")
+        t = self._current_time()
+        index = self._current_segment_index()
+        try:
+            # split_segment: new settings with the segment split at t.
+            self.settings = split_segment(self.settings, t)
+            # The right part keeps the crop and manual_override of the original.
+            # Recompute its index (segments list changed): it's the first whose
+            # start == t; fall back to the index just after the old one.
+            new_index = index + 1
+            for i, s in enumerate(self.settings["segments"]):
+                if abs(s["start"] - t) < 1e-6:
+                    new_index = i
+                    break
+            self._selected_segment = new_index
+            # Force _seek_to to treat this as a new segment (apply crop + preview),
+            # even though the time (and thus the raw segment_at) is unchanged.
+            self._shown_segment_index = -1
+            self._seek_to(t)
+            self._draw_timeline()
+        except Exception as exc:
+            messagebox.showwarning(
+                "Разделить",
+                f"Не удалось разделить сегмент:\n{exc}",
+                parent=self)
 
     def _on_canvas_configure(self, event=None):
         # Source canvas was resized: re-center the image and the crop box.

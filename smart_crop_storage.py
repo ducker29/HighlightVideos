@@ -274,7 +274,7 @@ def split_segment(settings, time, split_target=None, split_shot_type=None):
                 "shot_type": split_shot_type or segment["shot_type"],
                 "target": split_target or segment["target"],
                 "crop": dict(segment["crop"]),
-                "manual_override": False,
+                "manual_override": segment["manual_override"],
             }
             settings["segments"][i:i + 1] = [left, right]
             settings["segments"] = validate_segments(settings["segments"], duration)
