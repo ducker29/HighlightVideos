@@ -184,6 +184,7 @@ class HighlightApp:
         shorts_table_frame.pack(fill="both", expand=True)
         
         panes.add(self.notebook, weight=2)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._sync_active_tab_panel())
 
         review = ttk.LabelFrame(panes, text="Ревью выбранного кандидата", padding=6)
         fields = ttk.Frame(review)
@@ -506,7 +507,7 @@ class HighlightApp:
             self.title.set("")
             self.set_details("Подходящих кандидатов не найдено. Произвольные интервалы не создаются.")
         # Обновляем также таблицу Shorts
-        self.refresh_shorts_table(selected)
+        self.refresh_shorts_table(None)
 
     def set_details(self, text, chunks=None):
         self.details.configure(state="normal")
@@ -728,6 +729,13 @@ class HighlightApp:
         """Возвращает True, если активна вкладка Хайлайты."""
         return self.notebook.index(self.notebook.select()) == 0
 
+    def _sync_active_tab_panel(self):
+        """При переключении вкладки синхронизирует панель «Ревью» с уже выбранным кандидатом."""
+        if self._is_shorts_tab():
+            self.show_shorts_candidate()
+        else:
+            self.show_candidate()
+
     def current_shorts_candidate(self):
         """Возвращает текущего выбранного Shorts-кандидата."""
         selected = self.shorts_table.selection()
@@ -737,6 +745,7 @@ class HighlightApp:
 
     def refresh_shorts_table(self, selected=None):
         """Обновляет таблицу Shorts-кандидатов."""
+        previous_selection = self.shorts_table.selection()
         self.shorts_table.delete(*self.shorts_table.get_children())
         if not self.context:
             return
@@ -748,7 +757,11 @@ class HighlightApp:
                 "▶ Рендер*"))
         children = self.shorts_table.get_children()
         if children:
-            self.shorts_table.selection_set(selected if selected in children else children[0])
+            if selected is None and previous_selection:
+                selected = previous_selection[0] if previous_selection[0] in children else children[0]
+            else:
+                selected = selected if selected in children else children[0]
+            self.shorts_table.selection_set(selected)
         else:
             self.start.set("")
             self.end.set("")
@@ -759,6 +772,8 @@ class HighlightApp:
 
     def show_shorts_candidate(self):
         """Показывает детали выбранного Shorts-кандидата."""
+        if not self._is_shorts_tab():
+            return
         candidate = self.current_shorts_candidate()
         if not candidate:
             return
