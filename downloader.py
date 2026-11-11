@@ -3,7 +3,7 @@ import shutil
 import subprocess
 import json
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from job_store import DATA, load_json, save_json
 
@@ -27,15 +27,61 @@ def probe(path):
             "sample_aspect_ratio": sar, "frame_rate": video.get("avg_frame_rate"), "streams": info["streams"]}
 
 
-def download(url, log):
-    from yt_dlp import YoutubeDL
+def video_id_from_url(url):
+    """Локальный разбор YouTube-ссылки без сети; None для нестандартных форм."""
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower()
+    query = parse_qs(parts.query)
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        path = parts.path
+        if path == "/watch" and query.get("v"):
+            candidate = query["v"][0]
+        elif len(path) >= 2 and path[1:2] == "/":
+            segments = [s for s in path.split("/") if s]
+            if segments and segments[0] in {"embed", "live", "shorts", "v"}:
+                candidate = segments[1] if len(segments) > 1 else None
+        else:
+            candidate = None
+        if candidate:
+            if len(candidate) == 11 and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in candidate):
+                return candidate
+        return None
+    if host == "youtu.be":
+        candidate = next((s for s in parts.path.split("/") if s), None)
+        if candidate and len(candidate) == 11 and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in candidate):
+            return candidate
+    return None
 
+
+def download(url, log):
     host = (urlparse(url).hostname or "").lower()
     if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
         raise ValueError("Укажите ссылку на YouTube VOD.")
     for command in ("ffmpeg", "ffprobe"):
         if not shutil.which(command):
             raise RuntimeError(f"{command} не найден в PATH.")
+    local_id = video_id_from_url(url)
+    if local_id is not None:
+        job_dir = DATA / local_id
+        source = job_dir / "source.mkv"
+        manifest_path = job_dir / "source.json"
+        if source.exists() and manifest_path.exists():
+            try:
+                manifest = load_json(manifest_path)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Локальный манифест повреждён: {manifest_path}. "
+                                   f"Удалите файл вручную, чтобы скачать заново.") from exc
+            if manifest.get("video_id") != local_id:
+                raise RuntimeError(f"Локальный источник {local_id} не совпадает с манифестом "
+                                   f"({manifest.get('video_id')!r}). Проверьте файл вручную.")
+            try:
+                manifest["media"] = probe(source)
+            except (ValueError, OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"Локальный источник повреждён: {source} ({exc}). "
+                                   f"Удалите файл вручную, чтобы скачать заново.") from exc
+            log("Найден ранее скачанный источник — YouTube не запрашивается.")
+            return job_dir, manifest
+    from yt_dlp import YoutubeDL
     log("Получение метаданных YouTube…")
     base = {"noplaylist": True, "quiet": True, "noprogress": True, "no_warnings": False, "socket_timeout": 30,
             "http_chunk_size": 10 * 1024 * 1024, "retries": 3, "extractor_retries": 2}
