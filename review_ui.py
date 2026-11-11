@@ -10,7 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from analyzer import list_models
-from app_backend import open_report, run_analysis
+from app_backend import open_report, run_analysis, recalc_shorts_for_report
 from job_store import DATA, ROOT, analysis_bounds, load_json, parse_time, save_json, timecode, validate_interval
 from renderer import approval_key, output_filename, render_approved, render_shorts_approved, shorts_approval_key
 from clip_padding import padding_seconds, prepare_review_report, refresh_padding_overlaps, set_candidate_padding
@@ -134,6 +134,7 @@ class HighlightApp:
         self.button(actions, "Нарезать утвержденные клипы", self.render, row=0, column=2, padx=8)
         self.button(actions, "Рендер все Shorts", self.render_shorts, row=0, column=3, padx=8)
         self.button(actions, "Смарт-кроп", self.open_smart_crop, row=0, column=4, padx=8)
+        self.button(actions, "Пересчитать Shorts", self.recalc_shorts, row=1, column=3, padx=8)
         self.button(actions, "Применить запас к отчёту", self.apply_end_padding,
                     row=0, column=5, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
@@ -410,6 +411,39 @@ class HighlightApp:
             messagebox.showerror("Настройки", str(exc), parent=self.root)
             return
         self.start_worker("Скачивание и смысловой анализ…", lambda: run_analysis(settings, self.log))
+
+    def recalc_shorts(self):
+        """Keep every existing in-range Short; discover additional candidates."""
+        if self.busy:
+            return
+        if not self.context:
+            messagebox.showinfo("Пересчитать Shorts", "Сначала откройте отчёт.", parent=self.root)
+            return
+        if self.has_unsaved_edits():
+            messagebox.showinfo("Ревью", "Сначала сохраните правки выбранного кандидата.", parent=self.root)
+            return
+        if not self.shorts_enabled_var.get():
+            messagebox.showerror("Shorts", "Включите Shorts 9:16.", parent=self.root)
+            return
+        try:
+            minimum = int(self.variables["shorts_min_duration_sec"].get().strip())
+            target = int(self.variables["shorts_target_duration_sec"].get().strip())
+            maximum = int(self.variables["shorts_max_duration_sec"].get().strip())
+            if not 1 <= minimum <= target <= maximum:
+                raise ValueError("Нужно 1 ≤ минимум ≤ цель ≤ максимум.")
+            settings = copy.deepcopy(self.context["report"]["settings"])
+            shorts = copy.deepcopy(settings.get("outputs", {}).get("shorts", {}))
+            shorts.update(enabled=True, min_duration_sec=minimum,
+                          target_duration_sec=target, max_duration_sec=maximum)
+            settings.setdefault("outputs", {})["shorts"] = shorts
+            from job_store import normalize_profiles
+            normalize_profiles(settings["outputs"])
+        except (ValueError, TypeError, KeyError) as exc:
+            messagebox.showerror("Настройки Shorts", str(exc), parent=self.root)
+            return
+        context = self.context
+        self.start_worker("Пересчёт Shorts…",
+                          lambda: recalc_shorts_for_report(context, settings, self.log))
 
     def load_report(self):
         path = filedialog.askopenfilename(title="Открыть report.json", initialdir=str(DATA if DATA.exists() else ROOT),
@@ -900,6 +934,21 @@ class HighlightApp:
             path = settings_path(job_dir, signature, candidate["candidate_id"])
             if path.exists():
                 settings, _warnings = load_settings(path)
+                if (settings["candidate_id"] != candidate["candidate_id"]
+                        or abs(settings["source_start"] - float(candidate["start"])) > 0.001
+                        or abs(settings["source_end"] - float(candidate["end"])) > 0.001
+                        or settings["source_width"] != media["width"]
+                        or settings["source_height"] != media["height"]):
+                    if not messagebox.askyesno(
+                            "Смарт-кроп — изменились границы",
+                            f"Сохранённый Smart Crop для {candidate['candidate_id']} относится "
+                            "к другому интервалу или разрешению.\n\n"
+                            "Создать новую настройку центрального кадра для текущего Short? "
+                            "Старый файл будет заменён только после закрытия редактора с сохранением.",
+                            parent=self.root):
+                        return
+                    settings = create_settings(candidate["candidate_id"], candidate["start"], candidate["end"],
+                                               media["width"], media["height"])
             else:
                 settings = create_settings(candidate["candidate_id"], candidate["start"], candidate["end"],
                                            media["width"], media["height"])
@@ -930,10 +979,19 @@ class HighlightApp:
     def _close_smart_crop(self, window, path, editor):
         """Сохранить settings, остановить декодер и уничтожить Toplevel."""
         try:
+            # Не сохраняем настройки для устаревших границ, если отчёт изменился
+            # пока редактор был открыт.
+            current = next((c for c in self.context["report"].get("shorts_candidates", [])
+                            if c["candidate_id"] == editor.settings["candidate_id"]), None)
+            if (current is None
+                    or abs(float(current["start"]) - editor.settings["source_start"]) > 0.001
+                    or abs(float(current["end"]) - editor.settings["source_end"]) > 0.001):
+                raise ValueError("Границы Short изменились после открытия редактора. "
+                                 "Закройте окно без сохранения и откройте Smart Crop заново.")
             save_settings(editor.settings, path)
         except Exception as exc:
-            if not messagebox.askokcancel("Смарт-кроп", f"Не удалось сохранить Smart Crop:\n{exc}", parent=self.root):
-                return
+            messagebox.showerror("Смарт-кроп", f"Не удалось сохранить Smart Crop:\n{exc}", parent=self.root)
+            return
         editor.close()
         try:
             if window.winfo_exists():

@@ -395,13 +395,23 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         if smart_crop_file is not None:
             try:
                 settings, warnings = load_smart_crop_settings(smart_crop_file)
-            except SmartCropError as exc:
-                log(f"Smart Crop {clip['candidate_id']}: {exc} — использую стандартный кроп.")
-                settings = None
+            except (SmartCropError, OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Smart Crop {clip['candidate_id']} не удалось загрузить из {smart_crop_file}: {exc}. "
+                    "Откройте редактор Smart Crop и сохраните настройки заново."
+                ) from exc
             if settings is not None:
-                if settings["source_start"] != clip["start"] or settings["source_end"] != clip["end"]:
-                    log(f"Smart Crop {clip['candidate_id']} не соответствует утверждённому "
-                        f"интервалу — использую стандартный кроп.")
+                if (settings["candidate_id"] != clip["candidate_id"]
+                        or abs(settings["source_start"] - clip["start"]) > 0.001
+                        or abs(settings["source_end"] - clip["end"]) > 0.001
+                        or settings["source_width"] != media["width"]
+                        or settings["source_height"] != media["height"]):
+                    raise ValueError(
+                        f"Smart Crop {clip['candidate_id']} не соответствует текущему Short "
+                        f"({clip['start']:.2f}–{clip['end']:.2f}). "
+                        "Откройте редактор Smart Crop и настройте кадр заново. "
+                        f"Старый файл сохранён: {smart_crop_file}"
+                    )
                 else:
                     segments = settings["segments"]
                     crop_meta = []
