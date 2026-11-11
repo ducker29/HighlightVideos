@@ -292,14 +292,15 @@ def merge_segments(settings, index):
     right = segments[index + 1]
     if abs(left["end"] - right["start"]) > EPS:
         raise SmartCropError("cannot merge non-adjacent segments")
+    # The merged segment inherits crop and manual_override from the selected
+    # (left) segment; a merge is still a manual action, so the flag is kept.
     merged = {
         "start": left["start"],
         "end": right["end"],
         "shot_type": right["shot_type"],
         "target": right["target"],
-        "crop": dict(right["crop"]),
-        # A merge is a user action: the result is manual by definition.
-        "manual_override": left["manual_override"] or right["manual_override"] or True,
+        "crop": dict(left["crop"]),
+        "manual_override": left["manual_override"],
     }
     segments[index:index + 2] = [merged]
     settings["segments"] = validate_segments(segments, settings["source_end"] - settings["source_start"])

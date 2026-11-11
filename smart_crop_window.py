@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
 
-from smart_crop_storage import segment_at, set_segment_crop, split_segment
+from smart_crop_storage import segment_at, set_segment_crop, split_segment, merge_segments
 from job_store import timecode
 
 try:
@@ -374,6 +374,7 @@ class SmartCropWindow(ttk.Frame):
         ttk.Button(btns, text="кадр ⏭", command=lambda: self.step_frame(1)).pack(side="left", padx=2)
         ttk.Button(btns, text="Сбросить crop", command=self.reset_crop).pack(side="left", padx=2)
         ttk.Button(btns, text="Разделить", command=self.split_current_segment).pack(side="left", padx=2)
+        ttk.Button(btns, text="Объединить со следующим", command=self.merge_current_segment).pack(side="left", padx=2)
         self.crop_label = ttk.Label(btns, text="")
         self.crop_label.pack(side="left", padx=(8, 2))
 
@@ -816,6 +817,41 @@ class SmartCropWindow(ttk.Frame):
             messagebox.showwarning(
                 "Разделить",
                 f"Не удалось разделить сегмент:\n{exc}",
+                parent=self)
+
+    def merge_current_segment(self):
+        """Объединить выбранный сегмент со следующим."""
+        self._playing = False
+        self.play_btn.configure(text="▶ Play")
+        index = self._selected_segment
+        seg = self.settings["segments"][index] if 0 <= index < len(self.settings["segments"]) else None
+        if not seg:
+            messagebox.showwarning(
+                "Объединить",
+                "Нет выбранного сегмента.",
+                parent=self)
+            return
+        if index >= len(self.settings["segments"]) - 1:
+            messagebox.showwarning(
+                "Объединить",
+                "Нечего объединять: выбран последний сегмент.",
+                parent=self)
+            return
+        t = self._current_time()
+        try:
+            # merge_segments: new settings with segments[index] + [index+1] merged.
+            self.settings = merge_segments(self.settings, index)
+            # The merged segment takes the index of the left one.
+            self._selected_segment = index
+            # Keep the playhead inside the merged segment, preserving position.
+            t = min(max(0.0, t), self.settings["segments"][index]["end"])
+            self._shown_segment_index = -1
+            self._seek_to(t)
+            self._draw_timeline()
+        except Exception as exc:
+            messagebox.showwarning(
+                "Объединить",
+                f"Не удалось объединить сегменты:\n{exc}",
                 parent=self)
 
     def _on_canvas_configure(self, event=None):
