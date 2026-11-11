@@ -11,6 +11,11 @@ from pathlib import Path
 
 from downloader import probe
 from job_store import load_json, save_json, validate_interval
+from smart_crop_storage import (
+    SmartCropError,
+    load_settings as load_smart_crop_settings,
+    settings_path as smart_crop_settings_path,
+)
 from transcript_review import review_sections, transcript_chunks
 
 
@@ -186,6 +191,94 @@ def validate_crop_x(crop_x):
     return round(value, 4)
 
 
+def _smart_crop_file(job_dir, report, candidate):
+    """Возвращает путь к Smart Crop-файлу кандидата, если он существует."""
+    signature = report.get("signature")
+    if not signature:
+        return None
+    path = smart_crop_settings_path(job_dir, signature, candidate["candidate_id"])
+    return path if path.exists() else None
+
+
+def _crop_switch_exprs(segments, source_width, source_height):
+    """Строит crop-выражения c временным переключением по сегментам.
+
+    FFmpeg crop поддерживает таймлайн-выражения с t в этой сборке, поэтому
+    каждый сегмент задаётся ветвью if(lt(t, end_i), ...). Для последнего
+    сегмента используется else. Возвращает (w_expr, h_expr, x_expr, y_expr)
+    в виде Python-строк, готовых к подстановке в фильтр crop.
+
+    t здесь — время относительно начала Short (после -ss), что совпадает
+    с локальными start/end сегментов.
+    """
+    branches = []
+    for i, seg in enumerate(segments):
+        cw, ch, cx, cy = _crop_to_pixels(seg["crop"], source_width, source_height)
+        branches.append((cw, ch, cx, cy))
+
+    def branch_exprs(i):
+        cw, ch, cx, cy = branches[i]
+        return (str(cw), str(ch), str(cx), str(cy))
+
+    def build(i):
+        if i == len(segments) - 1:
+            return branch_exprs(i)
+        else_val = build(i + 1)
+        w, h, x, y = branch_exprs(i)
+        t = f"{segments[i]['end']:g}"
+        return tuple(
+            f"if(lt(t\\,{t}),{p},{e})" for p, e in zip((w, h, x, y), else_val)
+        )
+
+    return build(0)
+
+
+def _crop_to_pixels(crop, source_width, source_height):
+    """Переводит нормализованный crop (0..1) в пиксели исходного кадра.
+
+    Гарантирует границы кадра, корректную 9:16 геометрию (нечётные размеры
+    вырезаются по 9:16) и чётные x/y/ширина/высота для H.264 yuv420p.
+    Возвращает (crop_w, crop_h, x, y).
+    """
+    x = crop.get("x", 0.0)
+    y = crop.get("y", 0.0)
+    width = crop.get("width", 1.0)
+    height = crop.get("height", 1.0)
+
+    def even(n):
+        return max(0, int(n) // 2 * 2)
+
+    px = even(x * source_width)
+    py = even(y * source_height)
+    pw = even(width * source_width)
+    ph = even(height * source_height)
+    if pw < 2:
+        pw = 2
+    if ph < 2:
+        ph = 2
+    # Укладываем область в границы кадра.
+    if px + pw > source_width:
+        px = max(0, source_width - pw)
+    if py + ph > source_height:
+        py = max(0, source_height - ph)
+    px = even(px)
+    py = even(py)
+    pw = even(min(pw, source_width - px))
+    ph = even(min(ph, source_height - py))
+
+    # Корректируем размер, чтобы сохранить соотношение 9:16:
+    # берём высоту, которая даёт 9:16 при текущей ширине, и вписываем
+    # результат в оставшееся место кадра.
+    target_ratio = 9 / 16
+    crop_h = even(min(round(pw / target_ratio), source_height - py))
+    crop_w = even(min(round(crop_h * target_ratio), source_width - px))
+    if crop_w < 2:
+        crop_w = 2
+    if crop_h < 2:
+        crop_h = 2
+    return crop_w, crop_h, px, py
+
+
 def _srt_timecode(seconds):
     """Преобразует секунды в SRT-формат ЧЧ:ММ:СС,ммм."""
     milliseconds = max(0, round(seconds * 1000))
@@ -285,7 +378,6 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
     output_dir = Path(job_dir) / "output" / report["signature"] / "shorts"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    crop_w, crop_h, cx, cy = _crop_params(media["width"], media["height"])
     outputs = []
     for clip in approved:
         log(f"Рендер Shorts {clip['candidate_id']}: {clip['title']}")
@@ -295,15 +387,53 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         crop_x = validate_crop_x(crop_x_raw)
         subtitles_on = render_settings.get("subtitles_enabled", True)
 
-        crop_w, crop_h, cx, cy = _crop_params(media["width"], media["height"], crop_x)
+        # Приоритет: сохранённый Smart Crop (один или несколько сегментов),
+        # иначе — стандартное центрированное кадрирование по crop_mode/crop_x.
+        smart_crop_file = _smart_crop_file(job_dir, report, clip)
+        segments = None
+        crop_meta = None
+        if smart_crop_file is not None:
+            try:
+                settings, warnings = load_smart_crop_settings(smart_crop_file)
+            except SmartCropError as exc:
+                log(f"Smart Crop {clip['candidate_id']}: {exc} — использую стандартный кроп.")
+                settings = None
+            if settings is not None:
+                if settings["source_start"] != clip["start"] or settings["source_end"] != clip["end"]:
+                    log(f"Smart Crop {clip['candidate_id']} не соответствует утверждённому "
+                        f"интервалу — использую стандартный кроп.")
+                else:
+                    segments = settings["segments"]
+                    crop_meta = []
+                    for seg in segments:
+                        crop_meta.append(_crop_to_pixels(seg["crop"], media["width"], media["height"]))
+                    if len(segments) == 1:
+                        cw, ch, cx, cy = crop_meta[0]
+                        log(f"Smart Crop {clip['candidate_id']}: один сегмент, crop "
+                            f"{cw}x{ch} @ ({cx},{cy}).")
+                    else:
+                        log(f"Smart Crop {clip['candidate_id']}: {len(segments)} сегментов, "
+                            f"crop переключается по таймлайну.")
 
         target = output_dir / output_filename(clip, output_dir)
         temporary = target.with_suffix(".partial.mp4")
 
-        vf_parts = [
-            f"crop={crop_w}:{crop_h}:{cx}:{cy}",
-            f"scale={SHORTS_OUTPUT_W}:{SHORTS_OUTPUT_H}",
-        ]
+        if segments is not None:
+            if len(segments) == 1:
+                cw, ch, cx, cy = crop_meta[0]
+                crop_part = f"crop={cw}:{ch}:{cx}:{cy}"
+            else:
+                w_expr, h_expr, x_expr, y_expr = _crop_switch_exprs(
+                    segments, media["width"], media["height"])
+                crop_part = (f"crop=w='{w_expr}':h='{h_expr}'"
+                             f":x='{x_expr}':y='{y_expr}'")
+            vf_parts = [crop_part, f"scale={SHORTS_OUTPUT_W}:{SHORTS_OUTPUT_H}"]
+        else:
+            crop_w, crop_h, cx, cy = _crop_params(media["width"], media["height"], crop_x)
+            vf_parts = [
+                f"crop={crop_w}:{crop_h}:{cx}:{cy}",
+                f"scale={SHORTS_OUTPUT_W}:{SHORTS_OUTPUT_H}",
+            ]
         srt_keep_path = None
         tmp_srt_path = None
         if subtitles_on:
@@ -356,13 +486,28 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                 raise RuntimeError(
                     f"Длительность Shorts {clip['candidate_id']} не соответствует утверждённому интервалу.")
             temporary.rename(target)
+            if segments is not None:
+                crop_meta_out = {
+                    "mode": "smart",
+                    "smart_crop": True,
+                    "segments": [
+                        {"start": seg["start"], "end": seg["end"],
+                         "crop_pixels": {"width": cw, "height": ch, "x": cx, "y": cy},
+                         "manual_override": seg.get("manual_override", False)}
+                        for seg, (cw, ch, cx, cy) in zip(segments, crop_meta)
+                    ],
+                }
+            else:
+                crop_meta_out = {
+                    "width": crop_w, "height": crop_h, "x": cx, "y": cy,
+                    "mode": crop_mode, "crop_x": crop_x, "smart_crop": False,
+                }
             save_json(target.with_suffix(".json"), {
                 "source": manifest,
                 "approved_candidate": clip,
                 "output": str(target),
                 "media": rendered,
-                "crop": {"width": crop_w, "height": crop_h, "x": cx, "y": cy,
-                         "mode": crop_mode, "crop_x": crop_x},
+                "crop": crop_meta_out,
                 "subtitles": {"enabled": subtitles_on},
             })
             outputs.append(str(target))
