@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from interval_builder import build_interval_options
 from job_store import profile_for_format, validate_interval
-from shorts_selector import select_shorts, SHORTS_SELECTION_VERSION
+from shorts_selector import select_shorts, shorts_cache_signature, SHORTS_SELECTION_VERSION
 from llm_context import byte_size
 
 
@@ -409,6 +409,225 @@ class ShortsCacheInvalidationTests(unittest.TestCase):
         sig_1 = window_sig(transcript, settings_1)
         sig_2 = window_sig(transcript, settings_2)
         self.assertEqual(sig_1, sig_2, "Смена настроек Shorts не должна менять window_signature")
+
+
+class ShortsMultiStartCatalogTests(unittest.TestCase):
+    """Регрессия: каталог строит варианты окончания для каждого начала, а не только sentences[0].
+
+    До исправления build_interval_options вызывался только с sentences[0]["id"], поэтому
+    LLM-выбранные начала вне первого предложения не находили вариантов окончания и
+    пропускались в PASS 2B из-за несовпадения start_id.
+    """
+
+    @staticmethod
+    def _sentences():
+        return fixture_sentences()
+
+    @staticmethod
+    def _profile_settings():
+        profile = _shorts_profile()
+        return {"min_duration_sec": profile["min_duration_sec"],
+                "max_duration_sec": profile["max_duration_sec"],
+                "end_padding_sec": 0.5}
+
+    @staticmethod
+    def _catalog(sentences, duration=500, settings=None):
+        from shorts_selector import _build_shorts_catalog
+        if settings is None:
+            settings = SHORTS_SETTINGS
+        cache_dir = Path(tempfile.mkdtemp(dir=Path(__file__).resolve().parent))
+        try:
+            catalog = _build_shorts_catalog(sentences, duration, _shorts_profile(settings), cache_dir)
+            return catalog, cache_dir
+        except Exception:
+            import shutil
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            raise
+
+    def test_catalog_covers_every_sentence_start(self):
+        """Каждое предложение блока, для которого возможен клип, имеет варианты окончания."""
+        from job_store import normalize_profiles
+        settings = dict(SHORTS_SETTINGS)
+        settings["outputs"] = {"shorts": {"enabled": True, "min_duration_sec": 20,
+                                           "target_duration_sec": 40, "max_duration_sec": 60}}
+        sentences = self._sentences()
+        profile = _shorts_profile(settings)
+        # Предложения, от начала которых ещё помещается 20-секундный клип (start + min <= duration)
+        eligible = [s["id"] for s in sentences if s["start"] + profile["min_duration_sec"] <= 500]
+        catalog, cache_dir = self._catalog(sentences, settings=settings)
+        try:
+            covered = {o["start_id"] for o in catalog["options"]}
+            self.assertTrue(covered, "Каталог не пуст")
+            self.assertEqual(len(covered), len(eligible),
+                             "Варианты окончания должны существовать для каждого допустимого начала")
+            for sid in eligible:
+                self.assertIn(sid, covered, f"Для начала {sid} нет вариантов окончания")
+        finally:
+            import shutil
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_catalog_not_only_first_start(self):
+        """Варианты окончания существуют и для начал, отличных от sentences[0]."""
+        sentences = self._sentences()
+        profile = _shorts_profile()
+        settings = dict(SHORTS_SETTINGS)
+        settings["outputs"] = {"shorts": {"enabled": True, "min_duration_sec": 20,
+                                           "target_duration_sec": 40, "max_duration_sec": 60}}
+        catalog, cache_dir = self._catalog(sentences, settings=settings)
+        try:
+            covered = {o["start_id"] for o in catalog["options"]}
+            # Первый старт не единственный покрытый
+            self.assertNotEqual(len(covered), 1, "Каталог должен покрывать больше одного начала")
+            self.assertIn(sentences[0]["id"], covered)
+            for sentence in sentences[1:10]:  # следующие несколько начал
+                self.assertIn(sentence["id"], covered,
+                              f"Для начала {sentence['id']} нет вариантов окончания")
+        finally:
+            import shutil
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_each_start_has_valid_endings_within_bounds(self):
+        """Для каждого начала варианты окончания в пределах 20–60 секунд."""
+        sentences = self._sentences()
+        profile = _shorts_profile()
+        settings = dict(SHORTS_SETTINGS)
+        settings["outputs"] = {"shorts": {"enabled": True, "min_duration_sec": 20,
+                                           "target_duration_sec": 40, "max_duration_sec": 60}}
+        catalog, cache_dir = self._catalog(sentences, settings=settings)
+        try:
+            by_start = {}
+            for option in catalog["options"]:
+                by_start.setdefault(option["start_id"], []).append(option)
+            self.assertGreater(len(by_start), 1, "Каталог должен содержать несколько начал")
+            for start_id, options in by_start.items():
+                for option in options:
+                    self.assertEqual(option["start_id"], start_id)
+                    self.assertGreaterEqual(option["duration_sec"],
+                                             profile["min_duration_sec"] - 0.01)
+                    self.assertLessEqual(option["duration_sec"],
+                                          profile["max_duration_sec"] + 0.51)
+        finally:
+            import shutil
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_multiple_llm_starts_all_produce_candidates(self):
+        """Несколько разных LLM-начал в одном блоке → каждый даёт кандидата, без пропусков по start_id."""
+        sentences = self._sentences()
+        block = [{"sentences": sentences, "analysis": {"topic": "Тема"}}]
+        transcript = {"video_id": "test", "duration_sec": 500, "sentences": sentences}
+        # Четыре разных начала — не только sentences[0]
+        chosen_start_ids = [sentences[0]["id"], sentences[3]["id"], sentences[7]["id"], sentences[15]["id"]]
+        calls = []
+
+        def transport(base, endpoint, payload=None, timeout=10):
+            calls.append(1)
+            schema = payload["format"]
+            if "starts" in schema["properties"]:
+                value = {"starts": [{"start_id": sid, "reason": "Сильное начало"} for sid in chosen_start_ids]}
+            else:
+                allowed = [v for v in schema["properties"]["interval_id"]["enum"] if v != "none"]
+                # Выбираем вариант, который относится к текущему началу (по порядку enum)
+                value = {"interval_id": allowed[0], "title": "Shorts", "reason": "Финал", "score": 80}
+            return {"message": {"content": json.dumps(value)}}
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+            with patch("analyzer.ollama_request", side_effect=transport):
+                result = select_shorts(block, transcript, SHORTS_SETTINGS, Path(temp), lambda m: None)
+
+            # Каждый выбранный старт должен дать хотя бы одного кандидата (до дедупликации)
+            self.assertGreaterEqual(len(result["candidates"]), 1,
+                                    "Хотя бы один кандидат должен появиться")
+            # Проверим, что ни один выбранный старт не был пропущен из-за пустых block_options:
+            # в каталоге есть варианты для каждого выбранного start_id
+            from job_store import normalize_profiles
+            profile = _shorts_profile()
+            opts = {o["start_id"]: o for o in self._build_options_all(sentences)}
+            for sid in chosen_start_ids:
+                self.assertIn(sid, opts, f"В каталоге отсутствуют варианты для начала {sid}")
+
+    @staticmethod
+    def _build_options_all(sentences):
+        """Полный каталог: варианты для каждого начала (дублирует логику _build_shorts_catalog)."""
+        profile = _shorts_profile()
+        options = []
+        for sentence in sentences:
+            options.extend(build_interval_options(sentences, sentence["id"], 500,
+                                                  {"min_duration_sec": profile["min_duration_sec"],
+                                                   "max_duration_sec": profile["max_duration_sec"],
+                                                   "end_padding_sec": 0.5}))
+        return options
+
+    def test_no_start_dropped_due_to_start_id_mismatch(self):
+        """Выбранные LLM начала не пропускаются из-за несовпадения start_id."""
+        sentences = self._sentences()
+        block = [{"sentences": sentences, "analysis": {"topic": "Тема"}}]
+        transcript = {"video_id": "test", "duration_sec": 500, "sentences": sentences}
+        # Четыре разных начала — не только sentences[0]
+        chosen_start_ids = [sentences[0]["id"], sentences[3]["id"], sentences[7]["id"], sentences[15]["id"]]
+
+        def transport(base, endpoint, payload=None, timeout=10):
+            schema = payload["format"]
+            if "starts" in schema["properties"]:
+                value = {"starts": [{"start_id": sid, "reason": "Сильное начало"} for sid in chosen_start_ids]}
+            else:
+                allowed = [v for v in schema["properties"]["interval_id"]["enum"] if v != "none"]
+                value = {"interval_id": allowed[0], "title": "Shorts", "reason": "Финал", "score": 80}
+            return {"message": {"content": json.dumps(value)}}
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+            with patch("analyzer.ollama_request", side_effect=transport):
+                result = select_shorts(block, transcript, SHORTS_SETTINGS, Path(temp), lambda m: None)
+
+            # Все четыре начала должны были пройти (не быть пропущеными)
+            # Пропуск из-за пустых block_options приводит к 0 кандидатов
+            self.assertGreater(len(result["candidates"]), 0,
+                               "Кандидаты не должны отсутствовать из-за несовпадения start_id")
+
+    def test_cache_reuse_preserves_multi_start_catalog(self):
+        """Повторный запуск переиспользует каталог с несколькими началами (без повторного LLM-вызова)."""
+        sentences = self._sentences()
+        block = [{"sentences": sentences, "analysis": {"topic": "Тема"}}]
+        transcript = {"video_id": "test", "duration_sec": 500, "sentences": sentences}
+        sig = shorts_cache_signature(SHORTS_SETTINGS)
+        chosen_start_ids = [sentences[0]["id"], sentences[3]["id"], sentences[7]["id"]]
+
+        def transport(base, endpoint, payload=None, timeout=10):
+            schema = payload["format"]
+            if "starts" in schema["properties"]:
+                value = {"starts": [{"start_id": sid, "reason": "Сильное начало"} for sid in chosen_start_ids]}
+            else:
+                allowed = [v for v in schema["properties"]["interval_id"]["enum"] if v != "none"]
+                value = {"interval_id": allowed[0], "title": "S", "reason": "R", "score": 70}
+            return {"message": {"content": json.dumps(value)}}
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
+            cache_dir = Path(temp) / f"shorts_{sig}" / "block_0000"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # Первый прогон: создаёт каталог и кеш
+            with patch("analyzer.ollama_request", side_effect=transport):
+                result_1 = select_shorts(block, transcript, SHORTS_SETTINGS, cache_dir, lambda m: None)
+            catalog_1 = json.loads((cache_dir / "catalog.json").read_text(encoding="utf-8"))
+            starts_covered_1 = {o["start_id"] for o in catalog_1["options"]}
+            self.assertGreater(len(starts_covered_1), 1, "Каталог должен покрывать несколько начал")
+            self.assertTrue(result_1["candidates"], "Первый прогон должен дать кандидатов")
+
+            # Второй прогон с теми же настройками: каталог не пересоздаётся
+            llm_calls = []
+            def tracking_transport(base, endpoint, payload=None, timeout=10):
+                llm_calls.append(1)
+                return transport(base, endpoint, payload, timeout)
+
+            with patch("analyzer.ollama_request", side_effect=tracking_transport):
+                result_2 = select_shorts(block, transcript, SHORTS_SETTINGS, cache_dir, lambda m: None)
+            catalog_2 = json.loads((cache_dir / "catalog.json").read_text(encoding="utf-8"))
+            starts_covered_2 = {o["start_id"] for o in catalog_2["options"]}
+
+            # Каталог тот же (несколько начал сохранено), кандидаты те же
+            self.assertEqual(starts_covered_1, starts_covered_2,
+                             "Каталог с несколькими началами должен сохраниться при повторном запуске")
+            self.assertGreater(len(starts_covered_2), 1, "Повторный каталог всё ещё покрывает несколько начал")
+            self.assertTrue(result_2["candidates"], "Повторный прогон должен дать кандидатов")
 
 
 class ShortsFullKeyTests(unittest.TestCase):

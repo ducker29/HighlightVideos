@@ -1,5 +1,8 @@
 """Two-pass semantic selection. LLM selects IDs, never invents timestamps."""
 import hashlib
+import copy
+import re
+from pathlib import Path
 import json
 import urllib.error
 import urllib.request
@@ -426,4 +429,101 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
 
     save_json(job_dir / "latest_report.json", {"path": str(report_path.resolve())})
     log(f"Найдено кандидатов: {len(ranked)}. Финальная нарезка ожидает вашего утверждения.")
+    return report_path
+
+
+def recompute_shorts(job_dir, transcript, settings, report_path, log):
+    """Rebuild only Shorts using cached PASS 1; commit one report after full success."""
+    from job_store import normalize_profiles
+    from shorts_selector import select_shorts, shorts_full_key
+
+    job_dir, report_path = Path(job_dir), Path(report_path)
+    original = load_json(report_path)
+    if original.get("video_id") != transcript.get("video_id"):
+        raise ValueError("Транскрипт не соответствует отчёту.")
+    previous_settings = original["settings"]
+    # A changed Highlights configuration would invalidate PASS 1 and block layout.
+    for key in ("llm_model", "min_duration_sec", "max_duration_sec", "llm_context_tokens"):
+        if settings.get(key) != previous_settings.get(key):
+            raise ValueError(f"Пересчёт Shorts не допускает изменения {key}.")
+    profile = normalize_profiles(settings.get("outputs"))["shorts"]
+    if not profile["enabled"]:
+        raise ValueError("Для пересчёта включите Shorts.")
+    window_signature = hashlib.sha256(json.dumps({
+        "transcript": transcript, "model": settings["llm_model"],
+        "min": settings["min_duration_sec"], "max": settings["max_duration_sec"],
+        "version": PROMPT_VERSION}, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
+    window_cache = job_dir / "analysis" / window_signature
+    if original.get("window_cache") and Path(original["window_cache"]).resolve() != window_cache.resolve():
+        raise ValueError("Кеш PASS 1 не соответствует текущему отчёту.")
+
+    analyzed = []
+    all_windows = windows(transcript["sentences"])
+    for index, sentences in enumerate(all_windows):
+        path = window_cache / f"window_{index:04d}.json"
+        if path.exists():
+            analyzed.append({"sentences": sentences, "analysis": load_json(path)})
+            continue
+        following = all_windows[index + 1][:2] if index + 1 < len(all_windows) else []
+        previous = analyzed[-1]["analysis"]["summary"] if analyzed else "Начало записи."
+        parts = fit_sentence_groups(sentences, lambda part: window_prompt(part, previous, following),
+                                    overlap_seconds=30)
+        for part_index, part in enumerate(parts):
+            part_key = hashlib.sha256(sentence_json(part).encode()).hexdigest()[:10]
+            part_path = (path if len(parts) == 1 else
+                         window_cache / f"window_{index:04d}_part_{part_index:03d}_{part_key}.json")
+            if not part_path.exists():
+                raise ValueError(f"Отсутствует кеш PASS 1: {part_path}")
+            analyzed.append({"sentences": part, "analysis": load_json(part_path)})
+    if not analyzed:
+        raise ValueError("Отсутствуют сохранённые окна PASS 1.")
+
+    blocks = merge_windows(analyzed, maximum_span=max(900, settings["max_duration_sec"] + 300))
+    shorts_key = shorts_full_key(window_signature, settings)
+    found = []
+    for index, block in enumerate(blocks):
+        log(f"Пересчёт Shorts: блок {index + 1}/{len(blocks)}")
+        selection = select_shorts(block, transcript, settings,
+                                  job_dir / "analysis" / f"shorts_{shorts_key}" / f"block_{index:04d}", log)
+        if not selection["complete"]:
+            raise RuntimeError(f"Поиск Shorts в блоке {index + 1} завершился неполностью; отчёт не изменён: "
+                               + "; ".join(selection["warnings"]))
+        found.extend(dict(candidate, block_id=index) for candidate in selection["candidates"])
+
+    minimum, maximum = profile["min_duration_sec"], profile["max_duration_sec"]
+    old = original.get("shorts_candidates", [])
+    kept = [c for c in old if minimum - 0.001 <= float(c["end"]) - float(c["start"]) <= maximum + 0.001]
+    # Preserve all historical IDs, including IDs of removed candidates and files.
+    reserved = {c["candidate_id"] for c in old}
+    signature = original["signature"]
+    for folder in (job_dir / "analysis" / signature, job_dir / "output" / signature / "shorts"):
+        if folder.exists():
+            for file in folder.iterdir():
+                match = re.search(r"(?:smart_crop_)?(sc\d+)(?:_|\.)", file.name)
+                if match:
+                    reserved.add(match.group(1))
+    merged = list(kept)
+    next_number = max((int(cid[2:]) for cid in reserved if re.fullmatch(r"sc\d+", cid)), default=0) + 1
+    added = 0
+    for candidate in sorted(found, key=lambda c: c["score"], reverse=True):
+        # Same boundaries, or nearly identical intervals, are duplicates;
+        # substantial extensions of an existing Short are allowed.
+        if any(abs(candidate["start"] - c["start"]) < 0.5 and
+               abs(candidate["end"] - c["end"]) < 0.5 for c in merged):
+            continue
+        if any(interval_iou(candidate, c) >= 0.85 for c in merged):
+            continue
+        candidate = dict(candidate)
+        candidate["candidate_id"] = f"sc{next_number:03d}"
+        next_number += 1
+        merged.append(candidate)
+        added += 1
+
+    updated = copy.deepcopy(original)
+    updated["shorts_candidates"] = merged
+    updated["settings"] = copy.deepcopy(settings)
+    updated["profiles"] = normalize_profiles(settings.get("outputs"))
+    # save_json writes to a temporary file and atomically replaces report.json.
+    save_json(report_path, updated)
+    log(f"Shorts: сохранено старых {len(kept)}, исключено {len(old) - len(kept)}, добавлено {added}.")
     return report_path

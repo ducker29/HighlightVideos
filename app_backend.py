@@ -73,3 +73,11 @@ def open_report(path):
     quality_notes = load_json(notes_path) if notes_path.exists() else {}
     return {"job_dir": job_dir, "manifest": manifest, "report": report,
             "report_path": path, "transcript": transcript, "quality_notes": quality_notes}
+
+
+def recalc_shorts_for_report(context, settings, log):
+    """Recalculate Shorts only; reuse the transcript already tied to this report."""
+    from analyzer import recompute_shorts
+    report_path = recompute_shorts(context["job_dir"], context["transcript"],
+                                   settings, context["report_path"], log)
+    return open_report(report_path)

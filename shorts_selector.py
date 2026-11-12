@@ -14,7 +14,7 @@ from interval_builder import build_interval_options
 from job_store import normalize_profiles, profile_for_format, save_json, validate_interval
 from llm_context import INITIAL_PROMPT_BYTES, fit_option_batches, sentence_json
 
-SHORTS_SELECTION_VERSION = 1
+SHORTS_SELECTION_VERSION = 2
 
 START_PROMPT_TEMPLATE = ("Выбери до трёх сильных НАЧАЛ для вертикальных Shorts из тематического блока. "
                          "Shorts должен быть самодостаточным: понятный контекст, сильный захват "
@@ -117,7 +117,9 @@ def _build_shorts_catalog(sentences, duration, profile, cache_dir):
         profile_settings = {"min_duration_sec": profile["min_duration_sec"],
                             "max_duration_sec": profile["max_duration_sec"],
                             "end_padding_sec": profile.get("end_padding_sec", 0.5)}
-        options = build_interval_options(sentences, sentences[0]["id"], duration, profile_settings)
+        options = []
+        for sentence in sentences:
+            options.extend(build_interval_options(sentences, sentence["id"], duration, profile_settings))
         catalog = {"options": options, "profile": profile_settings,
                    "sentence_ids": [s["id"] for s in sentences]}
         save_json(catalog_path, catalog)
