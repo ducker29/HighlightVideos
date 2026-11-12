@@ -61,6 +61,21 @@ def portrait_fit(width, height, target_h):
     return w, h
 
 
+def split_time_for_displayed_frame(playhead_time, frame_time, duration):
+    """Use the decoded frame's actual local PTS for a manual split.
+
+    The decoder accepts a half-frame tolerance, so the frame displayed at a
+    slider position can be newer than the slider's nominal time. Saving the
+    slider value would then assign that first new frame to the old crop.
+    """
+    if frame_time is None:
+        raise ValueError("Cannot split until the requested preview frame is ready")
+    t = max(0.0, min(float(duration), float(frame_time)))
+    if not 0.0 < t < float(duration):
+        raise ValueError("Split frame must be inside the clip")
+    return round(t, 6)
+
+
 def segment_for(settings, time):
     """Return the segment dict containing time (same rules as storage.segment_at)."""
     index = segment_at(settings, time)
@@ -294,6 +309,7 @@ class SmartCropWindow(ttk.Frame):
         self._programmatic_slider_value = None
         self._seq = 0
         self._frame_pending = False
+        self._displayed_frame_local_time = None
         self._closed = False
         self._source_image = None
         self._preview_image = None
@@ -493,7 +509,7 @@ class SmartCropWindow(ttk.Frame):
                         self._events.put(("frame_failed", seq))
                         continue
                     if arr is not None:
-                        self._events.put(("frame", seq, arr))
+                        self._events.put(("frame", seq, arr, decoder._last_frame_time))
                     else:
                         self._events.put(("frame_failed", seq))
         finally:
@@ -525,10 +541,13 @@ class SmartCropWindow(ttk.Frame):
             self.info_label.configure(
                 text=f"{self.fps:.0f} fps · {self.duration:.2f} с")
         elif kind == "frame":
-            _, seq, arr = event
+            _, seq, arr, frame_time = event
             if seq < self._seq:  # stale frame from a superseded request
                 return
             self._frame_pending = False
+            self._displayed_frame_local_time = (
+                frame_time - self.start if frame_time is not None else None
+            )
             self._render(arr)
         elif kind == "frame_failed":
             if event[1] == self._seq:
@@ -551,6 +570,7 @@ class SmartCropWindow(ttk.Frame):
         if self._playing and self._frame_pending:
             return
         self._seq += 1
+        self._displayed_frame_local_time = None
         self._frame_pending = True
         self._commands.put(("get_frame", self._seq, local_to_absolute(t, self.start)))
 
@@ -794,9 +814,13 @@ class SmartCropWindow(ttk.Frame):
         """Разделить текущий сегмент по позиции playhead'а."""
         self._playing = False
         self.play_btn.configure(text="▶ Play")
-        t = self._current_time()
-        index = self._current_segment_index()
         try:
+            if self._frame_pending:
+                raise ValueError("Дождитесь загрузки кадра перед разделением")
+            t = split_time_for_displayed_frame(
+                self._current_time(), self._displayed_frame_local_time, self.duration
+            )
+            index = segment_at(self.settings, t)
             # split_segment: new settings with the segment split at t.
             self.settings = split_segment(self.settings, t)
             # The right part keeps the crop and manual_override of the original.
