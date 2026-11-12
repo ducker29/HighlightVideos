@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
-from subtitle_settings import DEFAULTS, LEGACY_STYLE, SubtitleSettings, build_ass, load_settings, save_settings
+from subtitle_settings import DEFAULTS, LEGACY_STYLE, SubtitleSettings, build_ass, load_settings, save_settings, subtitle_area
 from ui_editing import install_editing
 
 
@@ -23,6 +23,10 @@ def render_preview(settings):
         vf = f"subtitles='{_filtergraph_escape_path(path)}'"
         if settings == DEFAULTS:
             vf += f":force_style='{LEGACY_STYLE}'"
+        if settings.area_enabled:
+            left, top, right, bottom = subtitle_area(settings)
+            vf += (f",drawbox=x={left * 1080 / 384}:y={top * 1920 / 288}:"
+                   f"w={(right - left) * 1080 / 384}:h={(bottom - top) * 1920 / 288}:color=yellow@0.7:t=2")
         result = subprocess.run(
             ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=0x405570:s=1080x1920:d=0.04",
              "-vf", vf + ",scale=270:480", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "ppm", "pipe:1"],
@@ -52,33 +56,39 @@ class SubsSettingsWindow:
         labels = {"font": "Font", "font_size": "Font Size (ASS 384×288)",
                   "position_mode": "Позиционирование", "x": "Position X (%)", "y": "Position Y (%)",
                   "background_enabled": "Прямоугольная подложка", "background_color": "Background Color",
-                  "background_opacity": "Background Opacity (%)"}
+                  "background_opacity": "Background Opacity (%)",
+                  "outline_enabled": "Обводка текста", "outline_color": "Цвет обводки",
+                  "area_enabled": "Ограничить область субтитров",
+                  "width_percent": "Ширина области (%)", "height_percent": "Высота области (%)"}
         for row, (key, value) in enumerate(asdict(active).items()):
-            var = tk.BooleanVar(value=value) if key == "background_enabled" else tk.StringVar(value=str(value))
+            var = tk.BooleanVar(value=value) if type(value) is bool else tk.StringVar(value=str(value))
             self.variables[key] = var
             ttk.Label(frame, text=labels[key]).grid(row=row, column=0, sticky="w", pady=5)
             if key == "font":
                 widget = ttk.Combobox(frame, textvariable=var, values=fonts, width=30)
             elif key == "position_mode":
                 widget = ttk.Combobox(frame, textvariable=var, values=("historical", "free"), state="readonly")
-            elif key == "background_enabled":
+            elif type(value) is bool:
                 widget = ttk.Checkbutton(frame, variable=var)
             else:
                 widget = ttk.Entry(frame, textvariable=var)
                 install_editing(widget)
             widget.grid(row=row, column=1, sticky="ew", padx=8)
-            if key in ("x", "y", "background_opacity"):
-                ttk.Scale(frame, from_=0, to=100, variable=var).grid(row=row, column=2, sticky="ew")
-            if key == "background_color":
-                ttk.Button(frame, text="Выбрать цвет", command=self.choose_color).grid(row=row, column=2)
+            if key in ("x", "y", "background_opacity", "width_percent", "height_percent"):
+                ttk.Scale(frame, from_=1 if key.endswith("_percent") else 0, to=100,
+                          variable=var).grid(row=row, column=2, sticky="ew")
+            if key in ("background_color", "outline_color"):
+                ttk.Button(frame, text="Выбрать цвет", command=lambda k=key: self.choose_color(k)).grid(row=row, column=2)
             self.traces.append((var, var.trace_add("write", lambda *_, k=key: self.changed(k))))
         self.status = tk.StringVar()
-        ttk.Label(frame, textvariable=self.status, wraplength=540).grid(row=8, column=0, columnspan=3, sticky="w")
+        footer_row = len(self.variables)
+        ttk.Label(frame, textvariable=self.status, wraplength=540).grid(row=footer_row, column=0, columnspan=3, sticky="w")
         ttk.Label(frame, text="historical: исходные отступы. free: центр блока; у краёв позиция ограничивается.\n"
+                  "Область: перенос по ширине, обрезка за границами; размер шрифта не меняется.\n"
                   "Размер — единицы ASS, не пиксели. Применяется только к будущим Shorts.",
-                  wraplength=540).grid(row=9, column=0, columnspan=3, pady=10)
+                  wraplength=540).grid(row=footer_row + 1, column=0, columnspan=3, pady=10)
         actions = ttk.Frame(frame)
-        actions.grid(row=10, column=0, columnspan=3)
+        actions.grid(row=footer_row + 2, column=0, columnspan=3)
         for text, command in (("Save", self.save), ("Load", self.load),
                               ("Set Default", lambda: self.populate(DEFAULTS)), ("Применить", self.apply)):
             ttk.Button(actions, text=text, command=command).pack(side="left", padx=4)
@@ -87,7 +97,8 @@ class SubsSettingsWindow:
         self.image_label = ttk.Label(preview)
         self.image_label.pack()
         ttk.Label(preview, text="FFmpeg/libass, уменьшенный кадр 270×480.\n"
-                  "Масштабирование предпросмотра сглаживает детали.").pack()
+                  "Масштабирование предпросмотра сглаживает детали.\n"
+                  "Жёлтая рамка области — только в предпросмотре.").pack()
         self.top.protocol("WM_DELETE_WINDOW", self.close)
         self.top.bind("<Destroy>", self._destroy, add="+")
         self.changed()
@@ -111,7 +122,7 @@ class SubsSettingsWindow:
 
     def current(self):
         values = {key: var.get() for key, var in self.variables.items()}
-        for key in ("font_size", "x", "y", "background_opacity"):
+        for key in ("font_size", "x", "y", "background_opacity", "width_percent", "height_percent"):
             try:
                 values[key] = float(values[key])
             except ValueError as exc:
@@ -134,8 +145,13 @@ class SubsSettingsWindow:
     def changed(self, key=None):
         if self.closed:
             return
-        if key in ("x", "y") and self.variables["position_mode"].get() != "free":
+        if key in ("width_percent", "height_percent"):
+            self.variables["area_enabled"].set(True)
+        if (key in ("x", "y", "width_percent", "height_percent")
+                or key == "area_enabled" and self.variables["area_enabled"].get()) and self.variables["position_mode"].get() != "free":
             self.variables["position_mode"].set("free")
+        if key == "position_mode" and self.variables["position_mode"].get() == "historical":
+            self.variables["area_enabled"].set(False)
         self.revision += 1
         if self.preview_timer is not None:
             self.top.after_cancel(self.preview_timer)
@@ -180,10 +196,10 @@ class SubsSettingsWindow:
             pass
         self.timer = self.top.after(100, self.poll)
 
-    def choose_color(self):
-        color = colorchooser.askcolor(parent=self.top, title="Background Color")[1]
+    def choose_color(self, key="background_color"):
+        color = colorchooser.askcolor(parent=self.top, title="Цвет обводки" if key == "outline_color" else "Background Color")[1]
         if color:
-            self.variables["background_color"].set(color)
+            self.variables[key].set(color)
 
     def save(self):
         try:

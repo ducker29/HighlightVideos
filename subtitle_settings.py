@@ -22,23 +22,34 @@ class SubtitleSettings:
     background_enabled: bool = False
     background_color: str = "#000000"
     background_opacity: float = 100
+    outline_enabled: bool = True
+    outline_color: str = "#000000"
+    area_enabled: bool = False
+    width_percent: float = 68.75
+    height_percent: float = 100
 
     def __post_init__(self):
         if (not isinstance(self.font, str) or not self.font.strip()
                 or len(self.font) > 128 or re.search(r"[\x00-\x1f,{}\\'=;]", self.font)):
             raise ValueError("Некорректное семейство шрифта.")
         for name, low, high in (("font_size", 1, 144), ("x", 0, 100),
-                                ("y", 0, 100), ("background_opacity", 0, 100)):
+                                ("y", 0, 100), ("background_opacity", 0, 100),
+                                ("width_percent", 1, 100), ("height_percent", 1, 100)):
             value = getattr(self, name)
             if (type(value) not in (float, int) or not math.isfinite(value)
                     or not low <= value <= high):
                 raise ValueError(f"{name}: требуется число от {low} до {high}.")
         if self.position_mode not in ("historical", "free"):
             raise ValueError("Неизвестный режим позиции.")
-        if type(self.background_enabled) is not bool:
-            raise ValueError("background_enabled должен быть boolean.")
-        if not isinstance(self.background_color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", self.background_color):
-            raise ValueError("Цвет должен иметь вид #RRGGBB.")
+        for name in ("background_enabled", "outline_enabled", "area_enabled"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} должен быть boolean.")
+        for name in ("background_color", "outline_color"):
+            color = getattr(self, name)
+            if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+                raise ValueError(f"{name}: цвет должен иметь вид #RRGGBB.")
+        if self.area_enabled and self.position_mode != "free":
+            raise ValueError("Для ограничения области выберите позиционирование free.")
 
 
 DEFAULTS = SubtitleSettings()
@@ -48,18 +59,22 @@ LEGACY_STYLE = ("FontName=Arial,FontSize=18,PrimaryColour=&HFFFFFF&,"
 
 
 def document(settings):
-    return {"schema_version": 1, "shorts": asdict(settings)}
+    return {"schema_version": 2, "shorts": asdict(settings)}
 
 
 def from_document(value):
     if not isinstance(value, dict) or set(value) != {"schema_version", "shorts"}:
         raise ValueError("Ожидается JSON-пресет Subs Settings.")
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+    version = value["schema_version"]
+    if type(version) is not int or version not in (1, 2):
         raise ValueError("Неподдерживаемая версия пресета.")
     fields = value["shorts"]
-    if not isinstance(fields, dict) or set(fields) != set(asdict(DEFAULTS)):
+    defaults = asdict(DEFAULTS)
+    added_fields = {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent"}
+    expected = set(defaults) - added_fields if version == 1 else set(defaults)
+    if not isinstance(fields, dict) or set(fields) != expected:
         raise ValueError("Неверный набор параметров субтитров.")
-    return SubtitleSettings(**fields)
+    return SubtitleSettings(**(defaults | fields))
 
 
 def load_settings(path):
@@ -101,11 +116,25 @@ def _ass_time(srt_time):
     return f"{hours}:{minutes:02}:{seconds:02}.{centis:02}"
 
 
+def subtitle_area(settings):
+    """Fixed area in historical ASS units, centred at X/Y and shifted into frame.
+
+    Integer horizontal edges match ASS margins so wrapping and clipping agree.
+    Geometry depends only on settings, never on the current cue or font size.
+    """
+    width = max(1, round(384 * settings.width_percent / 100))
+    height = 288 * settings.height_percent / 100
+    left = max(0, min(384 - width, round(settings.x * 3.84 - width / 2)))
+    top = max(0, min(288 - height, settings.y * 2.88 - height / 2))
+    return left, top, left + width, top + height
+
+
 def build_ass(srt, settings):
     """Style only: preserve cue timing/content, escape literal ASS control characters.
 
-    Free positions use a centre anchor. Conservative text extents clamp the anchor
-    into the frame; libass handles wrapping within the script margins.
+    Unbounded free positions retain the previous conservative text-size clamp.
+    An enabled fixed area instead controls wrap margins and clips both layers,
+    with fixed font size and geometry independent of the current cue.
     """
     s = settings
     header = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\n"
@@ -115,12 +144,17 @@ def build_ass(srt, settings):
               "Alignment, MarginL, MarginR, MarginV, Encoding\n")
     align = 2 if s.position_mode == "historical" else 5
     margin = 240 if s.position_mode == "historical" else 0
-    header += (f"Style: Text,{s.font},{s.font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
-               f"0,0,0,0,100,100,0,0,1,1,0,{align},60,60,{margin},1\n")
-    # Separate box layer preserves the historical black text outline.
+    left_margin = right_margin = 60
+    if s.area_enabled:
+        left, top, right, bottom = subtitle_area(s)
+        left_margin, right_margin = left, 384 - right
+    outline = ass_color(s.outline_color, 100)
+    header += (f"Style: Text,{s.font},{s.font_size},&H00FFFFFF,&H00FFFFFF,{outline},&H00000000,"
+               f"0,0,0,0,100,100,0,0,1,{int(s.outline_enabled)},0,{align},{left_margin},{right_margin},{margin},1\n")
+    # The box layer is independent of the text's outline toggle and colour.
     bg = ass_color(s.background_color, s.background_opacity)
     header += (f"Style: Box,{s.font},{s.font_size},&HFFFFFFFF,&HFFFFFFFF,{bg},{bg},"
-               f"0,0,0,0,100,100,0,0,3,1,0,{align},60,60,{margin},1\n\n"
+               f"0,0,0,0,100,100,0,0,3,1,0,{align},{left_margin},{right_margin},{margin},1\n\n"
                "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     events = []
     for block in re.split(r"\r?\n\s*\r?\n", srt.strip().lstrip("\ufeff")):
@@ -131,7 +165,11 @@ def build_ass(srt, settings):
         text = "\\N".join(line.replace("\\", "\\\\").replace("{", r"\{").replace("}", r"\}")
                            for line in lines[2:])
         position = ""
-        if s.position_mode == "free":
+        if s.area_enabled:
+            x, y = (left + right) / 2, (top + bottom) / 2
+            position = (f"{{\\an5\\pos({x:.3f},{y:.3f})"
+                        f"\\clip({left:.3f},{top:.3f},{right:.3f},{bottom:.3f})}}")
+        elif s.position_mode == "free":
             half_w = min(190, max(len(line) for line in lines[2:]) * s.font_size * .36 + 3)
             half_h = min(142, len(lines[2:]) * s.font_size * .7 + 3)
             x = max(half_w, min(384 - half_w, s.x * 3.84))

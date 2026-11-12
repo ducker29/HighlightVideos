@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from subtitle_settings import (DEFAULTS, SubtitleSettings, ass_color, build_ass,
-                               document, from_document, load_settings, save_settings, _ass_time)
+                               document, from_document, load_settings, save_settings, _ass_time, subtitle_area)
 from subs_settings_window import SubsSettingsWindow, render_preview
 
 
@@ -21,7 +21,10 @@ class SettingsTests(unittest.TestCase):
                            ("font_size", 0), ("font_size", -1), ("font_size", float("nan")),
                            ("font_size", True), ("x", -1), ("y", 101), ("x", float("inf")),
                            ("background_color", "#12345"), ("background_opacity", 101),
-                           ("background_enabled", "yes"), ("position_mode", "unknown")):
+                           ("background_enabled", "yes"), ("position_mode", "unknown"),
+                           ("outline_enabled", 1), ("outline_color", "red"),
+                           ("area_enabled", "yes"), ("width_percent", 0), ("width_percent", True),
+                           ("height_percent", 101), ("height_percent", float("nan"))):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 replace(DEFAULTS, **{key: value})
         self.assertEqual(replace(DEFAULTS, x=42.5).x, 42.5)
@@ -29,7 +32,9 @@ class SettingsTests(unittest.TestCase):
     def test_preset_roundtrip_and_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "preset.json"
-            custom = replace(DEFAULTS, font="Missing Font Family", x=12.25, background_enabled=True)
+            custom = replace(DEFAULTS, font="Missing Font Family", x=12.25, background_enabled=True,
+                             outline_enabled=False, outline_color="#123456", area_enabled=True,
+                             position_mode="free", width_percent=42.25, height_percent=18.5)
             save_settings(path, custom)
             self.assertEqual(load_settings(path), custom)
             self.assertEqual(list(Path(directory).glob("*.tmp")), [])
@@ -38,6 +43,32 @@ class SettingsTests(unittest.TestCase):
                 path.write_text(content, encoding="utf-8")
                 with self.assertRaises(ValueError):
                     load_settings(path)
+
+    def test_v1_migration_preserves_style_and_v2_is_strict(self):
+        old_fields = {k: v for k, v in asdict(DEFAULTS).items()
+                      if k not in {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent"}}
+        self.assertEqual(from_document({"schema_version": 1, "shorts": old_fields}), DEFAULTS)
+        old_fields.update(position_mode="free", x=40, y=65, background_enabled=True)
+        migrated = from_document({"schema_version": 1, "shorts": old_fields})
+        self.assertFalse(migrated.area_enabled)
+        self.assertTrue(migrated.outline_enabled)
+        self.assertEqual(migrated.y, 65)
+        self.assertEqual(document(migrated)["schema_version"], 2)
+        with self.assertRaises(ValueError):
+            from_document({"schema_version": 2, "shorts": old_fields})
+
+    def test_area_and_outline_ass_keep_font_size(self):
+        settings = replace(DEFAULTS, position_mode="free", x=0, y=100, area_enabled=True,
+                           width_percent=50, height_percent=20, outline_enabled=False, outline_color="#123456")
+        left, top, right, bottom = subtitle_area(settings)
+        self.assertEqual((left, right), (0, 192))
+        self.assertAlmostEqual(bottom, 288)
+        srt = "1\n00:00:00,000 --> 00:00:02,000\nПример\n"
+        ass = build_ass(srt, settings)
+        self.assertIn("&H00563412&", ass)
+        self.assertIn(r"\clip(0.000,230.400,192.000,288.000)", ass)
+        self.assertIn("Style: Text,Arial,18,", ass)
+        self.assertNotIn(r"\fs", ass)
 
     def test_colors_defaults_and_ass(self):
         self.assertEqual(_ass_time("00:00:59,999"), "0:01:00.00")
@@ -81,10 +112,33 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(self.window.closed)
         self.assertEqual(self.root.tk.call("after", "info"), "")
 
+    def test_new_controls_and_color_picker(self):
+        self.window.variables["width_percent"].set("45.5")
+        self.window.variables["height_percent"].set("12.5")
+        self.window.variables["outline_enabled"].set(False)
+        with patch("subs_settings_window.colorchooser.askcolor", return_value=((18, 52, 86), "#123456")):
+            self.window.choose_color("outline_color")
+        self.window.apply()
+        settings = self.applied[-1]
+        self.assertEqual((settings.width_percent, settings.height_percent), (45.5, 12.5))
+        self.assertEqual(settings.font_size, DEFAULTS.font_size)
+        self.assertTrue(settings.area_enabled)
+        self.assertEqual(settings.position_mode, "free")
+        self.assertFalse(settings.outline_enabled)
+        self.assertEqual(settings.outline_color, "#123456")
+        self.window.populate(DEFAULTS)
+        self.assertTrue(self.window.current().outline_enabled)
+        self.assertFalse(self.window.current().area_enabled)
+
     def test_save_load_and_invalid_load_is_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "preset.json")
             self.window.variables["font_size"].set("24")
+            self.window.variables["width_percent"].set("40.5")
+            self.window.variables["height_percent"].set("25")
+            self.window.variables["outline_color"].set("#123456")
+            self.window.variables["outline_enabled"].set(False)
+            exported = self.window.current()
             with patch("subs_settings_window.filedialog.asksaveasfilename", return_value=path), \
                     patch("subs_settings_window.messagebox.showinfo"):
                 self.window.save()
@@ -93,6 +147,7 @@ class WindowTests(unittest.TestCase):
             with patch("subs_settings_window.filedialog.askopenfilename", return_value=path):
                 self.window.load()
             self.assertEqual(self.window.current().font_size, 24)
+            self.assertEqual(self.window.current(), exported)
             Path(path).write_text("{}", encoding="utf-8")
             before = self.window.current()
             with patch("subs_settings_window.filedialog.askopenfilename", return_value=path), \
@@ -128,7 +183,9 @@ class WindowTests(unittest.TestCase):
         self.window.close()
         with tempfile.TemporaryDirectory() as directory, patch.object(review_ui, "DATA", Path(directory)):
             app = review_ui.HighlightApp(self.root)
-            style = replace(DEFAULTS, background_enabled=True, background_opacity=42)
+            style = replace(DEFAULTS, background_enabled=True, background_opacity=42,
+                            outline_enabled=False, outline_color="#AA5522", position_mode="free",
+                            area_enabled=True, width_percent=45.5, height_percent=20.25)
             app.apply_subtitle_settings(style)
             self.assertEqual(load_settings(Path(directory) / "subtitle_settings.json"), style)
             second_root = tk.Toplevel(self.root)
@@ -141,6 +198,53 @@ class WindowTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg unavailable")
 class FFmpegTests(unittest.TestCase):
+    def render_ass_pixels(self, settings, text):
+        from renderer import _filtergraph_escape_path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.ass"
+            path.write_text(build_ass("1\n00:00:00,000 --> 00:00:02,000\n" + text + "\n", settings), encoding="utf-8-sig")
+            return subprocess.check_output(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                                            "color=c=black:s=384x288:d=0.04", "-vf",
+                                            f"subtitles='{_filtergraph_escape_path(path)}'", "-frames:v", "1",
+                                            "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], timeout=20)
+
+    def test_real_area_clips_without_resizing_and_width_wraps(self):
+        base = replace(DEFAULTS, position_mode="free", x=50, y=50, area_enabled=True,
+                       width_percent=50, height_percent=75, background_enabled=True,
+                       background_color="#FF0000")
+        small = replace(base, height_percent=12.5)
+        text = "Первая строка\nВторая строка\nТретья строка"
+        large_pixels = self.render_ass_pixels(base, text)
+        small_pixels = self.render_ass_pixels(small, text)
+        self.assertTrue(large_pixels != small_pixels)
+        left, top, right, bottom = subtitle_area(small)
+        for y in range(288):
+            row = small_pixels[y * 384 * 3:(y + 1) * 384 * 3]
+            if top <= y < bottom:
+                # Within the clip the glyph pixels must match the un-clipped rendering.
+                self.assertTrue(row == large_pixels[y * 384 * 3:(y + 1) * 384 * 3])
+                self.assertFalse(any(row[:left * 3]))
+                self.assertFalse(any(row[right * 3:]))
+            else:
+                self.assertFalse(any(row), f"Subtitle pixels outside the region at row {y}")
+        self.assertTrue(any(small_pixels))
+        text = "Это длинная реплика для проверки переносов текста по ширине заданной области"
+        wide = replace(base, background_enabled=False, width_percent=90, height_percent=100)
+        narrow = replace(wide, width_percent=30)
+        count_rows = lambda pixels: sum(any(pixels[y * 1152:(y + 1) * 1152]) for y in range(288))
+        self.assertGreater(count_rows(self.render_ass_pixels(narrow, text)),
+                           count_rows(self.render_ass_pixels(wide, text)))
+        self.assertTrue(render_preview(base) != render_preview(small))
+
+    def test_real_outline_toggle_and_color(self):
+        base = replace(DEFAULTS, position_mode="free", x=50, y=50, outline_color="#FF0000")
+        red = self.render_ass_pixels(base, "Обводка")
+        green = self.render_ass_pixels(replace(base, outline_color="#00FF00"), "Обводка")
+        disabled = self.render_ass_pixels(replace(base, outline_enabled=False), "Обводка")
+        self.assertTrue(red != green)
+        self.assertTrue(red != disabled)
+        self.assertEqual(disabled, self.render_ass_pixels(replace(base, outline_enabled=False,
+                                                                  outline_color="#00FF00"), "Обводка"))
     def test_default_pixels_match_original_filter(self):
         from renderer import _filtergraph_escape_path
         with tempfile.TemporaryDirectory() as directory:
@@ -186,7 +290,9 @@ class FFmpegTests(unittest.TestCase):
             before = copy.deepcopy(report)
             frames = []
             for settings in (DEFAULTS, replace(DEFAULTS, position_mode="free", y=70,
-                                               background_enabled=True, background_color="#FF0000")):
+                                               background_enabled=True, background_color="#FF0000",
+                                               outline_color="#00FF00", area_enabled=True,
+                                               width_percent=60, height_percent=15)):
                 outputs = renderer.render_shorts_approved({"source_path": str(source)}, report, directory,
                                                          lambda _: None, transcript=transcript,
                                                          subtitle_settings=settings)
