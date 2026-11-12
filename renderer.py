@@ -17,6 +17,7 @@ from smart_crop_storage import (
     settings_path as smart_crop_settings_path,
 )
 from transcript_review import review_sections, transcript_chunks
+from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, LEGACY_STYLE, build_ass, document as subtitle_document
 
 
 def approval_key(candidate):
@@ -354,8 +355,10 @@ def _probe_basic(path):
     }
 
 
-def render_shorts_approved(manifest, report, job_dir, log, transcript=None, candidate_id=None):
+def render_shorts_approved(manifest, report, job_dir, log, transcript=None, candidate_id=None,
+                           subtitle_settings=None):
     """Рендер утверждённых Shorts 9:16 с crop и необязательными субтитрами."""
+    subtitle_settings = subtitle_settings or SUBTITLE_DEFAULTS
     shorts = report.get("shorts_candidates", [])
     if candidate_id is not None:
         shorts = [c for c in shorts if c["candidate_id"] == candidate_id]
@@ -455,16 +458,14 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                     raise RuntimeError(f"SRT не создан или пуст: {srt_keep_path}")
                 # Временный SRT с коротким ASCII-именем в том же каталоге,
                 # чтобы FFmpeg subtitles-фильтр точно находил файл.
+                custom_style = subtitle_settings != SUBTITLE_DEFAULTS
                 fd, tmp_srt_path = tempfile.mkstemp(
-                    prefix="subs_", suffix=".srt", dir=str(output_dir), text=True)
+                    prefix="subs_", suffix=".ass" if custom_style else ".srt", dir=str(output_dir), text=True)
                 with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
-                    f.write(srt_content)
+                    f.write(build_ass(srt_content, subtitle_settings) if custom_style else srt_content)
                 escaped = _filtergraph_escape_path(tmp_srt_path)
-                vf_parts.append(
-                    f"subtitles='{escaped}':force_style='FontName=Arial,FontSize=18,"
-                    f"PrimaryColour=&HFFFFFF&,OutlineColour=&H00000000&,Outline=1,Alignment=2,"
-                    f"MarginV={SUBTITLE_SAFE_BOTTOM},MarginL={SUBTITLE_SAFE_SIDE},MarginR={SUBTITLE_SAFE_SIDE}'"
-                )
+                vf_parts.append(f"subtitles='{escaped}'" if custom_style else
+                                f"subtitles='{escaped}':force_style='{LEGACY_STYLE}'")
 
         vf = ",".join(vf_parts)
         duration = clip["end"] - clip["start"]
@@ -518,7 +519,7 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                 "output": str(target),
                 "media": rendered,
                 "crop": crop_meta_out,
-                "subtitles": {"enabled": subtitles_on},
+                "subtitles": {"enabled": subtitles_on, "style": subtitle_document(subtitle_settings)},
             })
             outputs.append(str(target))
             log(f"Сохранено: {target}")
