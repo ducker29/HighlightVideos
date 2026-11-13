@@ -18,6 +18,7 @@ from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
 from smart_crop_storage import create_settings, load_settings, save_settings, settings_path
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, load_settings as load_subtitle_settings, save_settings as save_subtitle_settings
+from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, load_settings as load_shorts_settings, save_settings as save_shorts_settings
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -38,6 +39,14 @@ class HighlightApp:
         self.settings = load_json(ROOT / "config.json")
         self.subtitle_settings = SUBTITLE_DEFAULTS
         self.subs_window = None
+        self.shorts_export_settings = SHORTS_DEFAULTS
+        self.shorts_settings_window = None
+        shorts_path = DATA / "shorts_render_settings.json"
+        if shorts_path.exists():
+            try:
+                self.shorts_export_settings = load_shorts_settings(shorts_path)
+            except (ValueError, OSError) as exc:
+                messagebox.showwarning("Настройки Shorts", f"Используются 1080p и CRF 18. Настройки не загружены:\n{exc}", parent=root)
         subtitle_path = DATA / "subtitle_settings.json"
         if subtitle_path.exists():
             try:
@@ -145,6 +154,7 @@ class HighlightApp:
         self.button(actions, "Смарт-кроп", self.open_smart_crop, row=0, column=4, padx=8)
         self.button(actions, "Пересчитать Shorts", self.recalc_shorts, row=1, column=3, padx=8)
         self.button(actions, "Subs Settings", self.open_subs_settings, row=1, column=4, padx=8)
+        self.button(actions, "Настройки Shorts", self.open_shorts_settings, row=1, column=5, padx=8)
         self.button(actions, "Применить запас к отчёту", self.apply_end_padding,
                     row=0, column=5, padx=8)
         self.progress = ttk.Progressbar(actions, mode="indeterminate", length=150)
@@ -735,11 +745,26 @@ class HighlightApp:
         job_dir = self.context["job_dir"]
         transcript = copy.deepcopy(self.context["transcript"])
         subtitle_settings = self.subtitle_settings
+        export_settings = self.shorts_export_settings
         self.start_worker(
             f"Рендер Shorts ({len(approved)} шт.)…",
             lambda: render_shorts_approved(manifest, report, job_dir, self.log,
                                             transcript=transcript, candidate_id=candidate_id,
-                                            subtitle_settings=subtitle_settings))
+                                            subtitle_settings=subtitle_settings, export_settings=export_settings))
+
+    def open_shorts_settings(self):
+        if self.shorts_settings_window is not None and not self.shorts_settings_window.closed:
+            self.shorts_settings_window.top.deiconify()
+            self.shorts_settings_window.top.lift()
+            self.shorts_settings_window.top.focus_set()
+            return
+        from shorts_settings_window import ShortsSettingsWindow
+        self.shorts_settings_window = ShortsSettingsWindow(self.root, self.shorts_export_settings,
+                                                          self.apply_shorts_settings)
+
+    def apply_shorts_settings(self, settings):
+        save_shorts_settings(DATA / "shorts_render_settings.json", settings)
+        self.shorts_export_settings = settings
 
     def open_subs_settings(self):
         if self.subs_window is not None and not self.subs_window.closed:

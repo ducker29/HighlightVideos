@@ -18,6 +18,7 @@ from smart_crop_storage import (
 )
 from transcript_review import review_sections, transcript_chunks
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, LEGACY_STYLE, build_ass, document as subtitle_document
+from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, document as shorts_export_document
 
 
 def approval_key(candidate):
@@ -356,9 +357,10 @@ def _probe_basic(path):
 
 
 def render_shorts_approved(manifest, report, job_dir, log, transcript=None, candidate_id=None,
-                           subtitle_settings=None):
+                           subtitle_settings=None, export_settings=None):
     """Рендер утверждённых Shorts 9:16 с crop и необязательными субтитрами."""
     subtitle_settings = subtitle_settings or SUBTITLE_DEFAULTS
+    export_settings = export_settings or SHORTS_DEFAULTS
     shorts = report.get("shorts_candidates", [])
     if candidate_id is not None:
         shorts = [c for c in shorts if c["candidate_id"] == candidate_id]
@@ -366,6 +368,9 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
     if not approved:
         raise ValueError("Нет утверждённых Shorts.")
     media = probe(manifest["source_path"])
+    output_w, output_h = export_settings.output_size(media["width"], media["height"])
+    log(f"Экспорт Shorts: {export_settings.resolution}, {output_w}x{output_h}, "
+        f"{export_settings.compression}, CRF {export_settings.crf}.")
     profiles = report.get("profiles", {})
     shorts_profile = profiles.get("shorts", {})
     min_dur = shorts_profile.get("min_duration_sec", 20)
@@ -440,12 +445,12 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                     segments, media["width"], media["height"])
                 crop_part = (f"crop=w='{w_expr}':h='{h_expr}'"
                              f":x='{x_expr}':y='{y_expr}'")
-            vf_parts = [crop_part, f"scale={SHORTS_OUTPUT_W}:{SHORTS_OUTPUT_H}"]
+            vf_parts = [crop_part, f"scale={output_w}:{output_h}"]
         else:
             crop_w, crop_h, cx, cy = _crop_params(media["width"], media["height"], crop_x)
             vf_parts = [
                 f"crop={crop_w}:{crop_h}:{cx}:{cy}",
-                f"scale={SHORTS_OUTPUT_W}:{SHORTS_OUTPUT_H}",
+                f"scale={output_w}:{output_h}",
             ]
         srt_keep_path = None
         tmp_srt_path = None
@@ -475,7 +480,7 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
             "-t", str(duration),
             "-map", "0:v:0", "-map", "0:a:0",
             "-vf", vf,
-            "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+            "-c:v", "libx264", "-crf", str(export_settings.crf), "-preset", "slow",
             "-fps_mode", "passthrough",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
@@ -489,10 +494,10 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                 raise RuntimeError(f"FFmpeg (Shorts {clip['candidate_id']}) завершился с кодом "
                                    f"{result.returncode}. Подробности: {log_path}")
             rendered = _probe_basic(temporary)
-            if (rendered["width"], rendered["height"]) != (SHORTS_OUTPUT_W, SHORTS_OUTPUT_H):
+            if (rendered["width"], rendered["height"]) != (output_w, output_h):
                 raise RuntimeError(
                     f"Разрешение Shorts {clip['candidate_id']}: "
-                    f"{rendered['width']}x{rendered['height']}, ожидается {SHORTS_OUTPUT_W}x{SHORTS_OUTPUT_H}.")
+                    f"{rendered['width']}x{rendered['height']}, ожидается {output_w}x{output_h}.")
             if abs(rendered["duration_sec"] - duration) > 0.3:
                 raise RuntimeError(
                     f"Длительность Shorts {clip['candidate_id']} не соответствует утверждённому интервалу.")
@@ -520,6 +525,8 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                 "media": rendered,
                 "crop": crop_meta_out,
                 "subtitles": {"enabled": subtitles_on, "style": subtitle_document(subtitle_settings)},
+                "export_settings": {**shorts_export_document(export_settings), "crf": export_settings.crf,
+                                    "output_width": output_w, "output_height": output_h},
             })
             outputs.append(str(target))
             log(f"Сохранено: {target}")
