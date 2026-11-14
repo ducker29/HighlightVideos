@@ -1,0 +1,201 @@
+"""YouTube downloads: a single combined A/V stream, with an independent fallback."""
+import math
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+from downloader import probe, video_id_from_url
+from job_store import load_json, save_json
+
+
+class SourcePolicyError(ValueError):
+    """Invalid identity, live broadcast or damaged cache, not a transport failure."""
+
+
+def combined_quality_key(height, fps=0, bitrate=0):
+    """1080p, nearest higher resolution, then highest lower resolution."""
+    height = int(height)
+    if height <= 0:
+        raise ValueError("Неизвестное разрешение потока.")
+    tier = 0 if height == 1080 else 1 if height > 1080 else 2
+    return tier, height if tier == 1 else -height, -(fps or 0), -(bitrate or 0)
+
+
+def select_combined_format(formats):
+    formats = [f for f in formats if f.get("vcodec") not in (None, "none")
+               and f.get("acodec") not in (None, "none") and not f.get("has_drm")
+               and type(f.get("height")) in (int, float) and math.isfinite(f["height"]) and f["height"] > 0
+               and isinstance(f.get("format_id"), str)
+               and re.fullmatch(r"[A-Za-z0-9_.-]+", f["format_id"])]
+    if not formats:
+        raise RuntimeError("Нет совмещённого потока с видео и звуком. Раздельная загрузка отключена.")
+    return min(formats, key=lambda f: combined_quality_key(f["height"], f.get("fps"), f.get("tbr")))
+
+
+def select_progressive_stream(streams):
+    streams = [s for s in streams if s.is_progressive and re.fullmatch(r"\d+p", s.resolution or "")]
+    if not streams:
+        raise RuntimeError("pytubefix: нет готового потока с видео и звуком. Раздельная загрузка отключена.")
+    return min(streams, key=lambda s: combined_quality_key(int(s.resolution[:-1]), s.fps, s.bitrate))
+
+
+def _job_dir(root, video_id, expected_id=None):
+    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise SourcePolicyError("Некорректный ID видео.")
+    if expected_id is not None and video_id != expected_id:
+        raise SourcePolicyError("ID полученного видео не совпадает с YouTube-ссылкой.")
+    return Path(root) / video_id
+
+
+def _cached_source(root, video_id, log):
+    job_dir = _job_dir(root, video_id)
+    source = job_dir / "source.mkv"
+    manifest_path = job_dir / "source.json"
+    if not source.exists():
+        return None
+    if not manifest_path.exists():
+        raise SourcePolicyError(f"Источник уже существует без манифеста: {source}. "
+                                "Проверьте файлы вручную; автоматическая перезапись отключена.")
+    try:
+        manifest = load_json(manifest_path)
+        if not isinstance(manifest, dict) or manifest.get("video_id") != video_id:
+            raise ValueError("ID источника не совпадает с манифестом.")
+        manifest["media"] = probe(source)
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        raise SourcePolicyError(f"Сохранённый источник или манифест повреждён: {source} ({exc}). "
+                                "Проверьте файлы вручную; автоматическая перезапись отключена.") from exc
+    log("Найден ранее скачанный источник — YouTube не запрашивается. Его разрешение сохраняется.")
+    return job_dir, manifest
+
+
+def _publish_source(staged, meta, job_dir, backend, selection, log):
+    media = probe(staged)
+    source = job_dir / "source.mkv"
+    if source.exists():
+        raise SourcePolicyError(f"Источник появился во время загрузки: {source}. Перезапись отключена.")
+    staged.rename(source)
+    manifest = {"video_id": meta["id"], "url": meta["url"], "title": meta.get("title") or meta["id"],
+                "upload_date": meta.get("upload_date"), "source_path": str(source.resolve()), "media": media,
+                "download_info": {"backend": backend, "combined_stream": True,
+                                  "selection_policy": "1080_then_nearest_higher_then_best_lower", **selection}}
+    save_json(job_dir / "source.json", manifest)
+    log(f"Источник готов: {media['width']}×{media['height']}, видео со звуком, загрузчик {backend}.")
+    return job_dir, manifest
+
+
+def _download_ytdlp(url, expected_id, log, root):
+    from yt_dlp import YoutubeDL
+    log("Получение метаданных YouTube…")
+    base = {"noplaylist": True, "quiet": True, "noprogress": True, "no_warnings": False, "socket_timeout": 30,
+            "http_chunk_size": 10 * 1024 * 1024, "retries": 3, "extractor_retries": 2,
+            "format": "best[vcodec!=none][acodec!=none]", "skip_unavailable_fragments": False}
+    if shutil.which("node"):
+        base["js_runtimes"] = {"node": {"path": shutil.which("node")}}
+    with YoutubeDL(base) as ydl:
+        meta = ydl.extract_info(url, download=False)
+    if meta.get("is_live") or meta.get("live_status") == "is_upcoming":
+        raise SourcePolicyError("Нужна завершённая запись, а не текущая или запланированная трансляция.")
+    video_id = meta["id"]
+    job_dir = _job_dir(root, video_id, expected_id)
+    cached = _cached_source(root, video_id, log)
+    if cached:
+        return cached
+    selected = select_combined_format(meta.get("formats") or [])
+    height = int(selected["height"])
+    log(f"yt-dlp: выбран готовый поток {height}p с видео и звуком (приоритет 1080p → выше → ниже).")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    last_bucket = [-1]
+
+    def progress(event):
+        if event["status"] == "downloading":
+            total = event.get("total_bytes") or event.get("total_bytes_estimate")
+            if total:
+                percent = int(100 * event.get("downloaded_bytes", 0) / total)
+                if percent // 10 != last_bucket[0]:
+                    last_bucket[0] = percent // 10
+                    log(f"Скачивание потока: {percent}%")
+
+    with tempfile.TemporaryDirectory(prefix="download_ytdlp_", dir=job_dir) as directory:
+        options = dict(base, format=str(selected["format_id"]),
+                       outtmpl=str(Path(directory) / "source.%(ext)s"), progress_hooks=[progress],
+                       postprocessors=[{"key": "FFmpegVideoRemuxer", "preferedformat": "mkv"}])
+        log("Скачивание одного потока с видео и звуком…")
+        with YoutubeDL(options) as ydl:
+            ydl.download([url])
+        staged = Path(directory) / "source.mkv"
+        if not staged.exists():
+            raise RuntimeError("yt-dlp не создал ожидаемый source.mkv.")
+        return _publish_source(staged, {**meta, "url": url}, job_dir, "yt-dlp",
+                               {"format_id": selected["format_id"], "selected_height": height}, log)
+
+
+def _download_pytubefix(url, expected_id, log, root):
+    try:
+        from pytubefix import YouTube
+    except ImportError as exc:
+        raise RuntimeError("Резервный pytubefix не установлен. Установите зависимости из requirements.txt.") from exc
+    last_bucket = [-1]
+
+    def progress(stream, chunk, remaining):
+        total = stream.filesize
+        if total:
+            percent = int(100 * (total - remaining) / total)
+            if percent // 10 != last_bucket[0]:
+                last_bucket[0] = percent // 10
+                log(f"pytubefix: скачивание потока {percent}%")
+
+    video = YouTube(url, on_progress_callback=progress)
+    job_dir = _job_dir(root, video.video_id, expected_id)
+    details = video.vid_info.get("videoDetails", {})
+    if (details.get("isLive") or details.get("isUpcoming")
+            or video.vid_info.get("playabilityStatus", {}).get("status") == "LIVE_STREAM_OFFLINE"):
+        raise SourcePolicyError("Нужна завершённая запись, а не текущая или запланированная трансляция.")
+    cached = _cached_source(root, video.video_id, log)
+    if cached:
+        return cached
+    stream = select_progressive_stream(video.streams.filter(progressive=True))
+    log(f"pytubefix: выбран готовый поток {stream.resolution} с видео и звуком.")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="download_pytubefix_", dir=job_dir) as directory:
+        result = stream.download(output_path=directory, filename="combined." + stream.subtype,
+                                 skip_existing=False, timeout=30, max_retries=3)
+        if not result or not Path(result).is_file():
+            raise RuntimeError("pytubefix не создал видеофайл.")
+        staged = Path(directory) / "source.mkv"
+        # One input already contains both tracks. Remux only; no merging or encoding.
+        subprocess.run(["ffmpeg", "-v", "error", "-n", "-i", str(result), "-map", "0:v:0", "-map", "0:a:0",
+                        "-c", "copy", str(staged)], capture_output=True, check=True)
+        return _publish_source(staged, {"id": video.video_id, "url": url, "title": video.title},
+                               job_dir, "pytubefix", {"format_id": str(stream.itag),
+                                                     "selected_height": int(stream.resolution[:-1])}, log)
+
+
+def download(url, log, root):
+    host = (urlparse(url).hostname or "").lower()
+    if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
+        raise ValueError("Укажите ссылку на YouTube VOD.")
+    for command in ("ffmpeg", "ffprobe"):
+        if not shutil.which(command):
+            raise RuntimeError(f"{command} не найден в PATH.")
+    expected_id = video_id_from_url(url)
+    if expected_id is not None:
+        cached = _cached_source(root, expected_id, log)
+        if cached:
+            return cached
+    try:
+        return _download_ytdlp(url, expected_id, log, root)
+    except SourcePolicyError:
+        raise
+    except Exception as primary_error:
+        log(f"yt-dlp не завершил загрузку: {primary_error}")
+        log("Переход к резервному pytubefix. Только готовые потоки с видео и звуком.")
+        try:
+            return _download_pytubefix(url, expected_id, log, root)
+        except SourcePolicyError:
+            raise
+        except Exception as fallback_error:
+            raise RuntimeError(f"Не удалось скачать видео ни одним загрузчиком.\nyt-dlp: {primary_error}\n"
+                               f"pytubefix: {fallback_error}") from fallback_error

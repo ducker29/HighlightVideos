@@ -17,12 +17,17 @@ from smart_crop_storage import (
     settings_path as smart_crop_settings_path,
 )
 from transcript_review import review_sections, transcript_chunks
+from transcript_editing import apply_transcript_edits
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, LEGACY_STYLE, build_ass, document as subtitle_document
 from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, document as shorts_export_document
+from local_source import verify_local_source
 
 
 def approval_key(candidate):
-    return hashlib.sha256(json.dumps({k: candidate[k] for k in ("candidate_id", "start", "end")},
+    payload = {k: candidate[k] for k in ("candidate_id", "start", "end")}
+    if candidate.get("transcript_edits"):
+        payload["transcript_edits"] = candidate["transcript_edits"]
+    return hashlib.sha256(json.dumps(payload,
                                      sort_keys=True).encode()).hexdigest()
 
 
@@ -44,6 +49,8 @@ def shorts_approval_key(candidate):
         "output_height": render.get("output_height", 1920),
         "end_padding": candidate.get("end_padding"),
     }
+    if candidate.get("transcript_edits"):
+        payload["transcript_edits"] = candidate["transcript_edits"]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
                                      allow_nan=False).encode("utf-8")).hexdigest()
 
@@ -82,6 +89,7 @@ def output_filename(candidate, output_dir=None):
 
 
 def clip_text(clip, transcript):
+    transcript = apply_transcript_edits(transcript, clip.get("transcript_edits"))
     sections = review_sections(transcript, clip["start"], clip["end"])
     return (f"Название клипа: {clip.get('title') or 'Без названия'}\n\n"
             f"Почему выбран: {clip.get('reason') or 'Не указано.'}\n\n"
@@ -92,6 +100,7 @@ def render_approved(manifest, report, job_dir, log, transcript=None):
     clips = [c for c in report["candidates"] if c["status"] == "approved"]
     if not clips:
         raise ValueError("Нет утверждённых клипов.")
+    verify_local_source(manifest, log)
     media = probe(manifest["source_path"])
     for clip in clips:
         validate_interval(clip["start"], clip["end"], media["duration_sec"],
@@ -227,7 +236,7 @@ def _crop_switch_exprs(segments, source_width, source_height):
             return branch_exprs(i)
         else_val = build(i + 1)
         w, h, x, y = branch_exprs(i)
-        t = f"{segments[i]['end']:g}"
+        t = f"{segments[i]['end']:.6f}"
         return tuple(
             f"if(lt(t\\,{t}),{p},{e})" for p, e in zip((w, h, x, y), else_val)
         )
@@ -304,7 +313,7 @@ def _group_words_into_cues(words, max_words=SUBTITLE_MAX_WORDS_PER_CUE):
     return cues
 
 
-def build_subtitles_srt(transcript, clip_start, clip_end):
+def build_subtitles_srt(transcript, clip_start, clip_end, *, return_cues=False):
     """Строит SRT-текст из word timestamps, попадающих в [clip_start, clip_end].
 
     Таймкоды пересчитываются относительно начала клипа (0.0).
@@ -322,7 +331,7 @@ def build_subtitles_srt(transcript, clip_start, clip_end):
                               "word": w["word"].strip()})
     words.sort(key=lambda x: x["start"])
     if not words:
-        return ""
+        return ("", []) if return_cues else ""
     cues = _group_words_into_cues(words)
     lines = []
     for i, cue in enumerate(cues, 1):
@@ -334,10 +343,13 @@ def build_subtitles_srt(transcript, clip_start, clip_end):
             mid = len(text) // 2
             space = text.find(" ", mid - 5, mid + 5)
             if space == -1:
-                space = mid
-            text = text[:space] + "\n" + text[space + 1:]
+                space = min((i for i, char in enumerate(text) if char == " "),
+                            key=lambda i: abs(i - mid), default=-1)
+            if space >= 0:
+                text = text[:space] + "\n" + text[space + 1:]
         lines.append(f"{i}\n{_srt_timecode(start)} --> {_srt_timecode(end)}\n{text}\n")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return (result, cues) if return_cues else result
 
 
 def _probe_basic(path):
@@ -367,6 +379,7 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
     approved = [c for c in shorts if c["status"] == "approved"]
     if not approved:
         raise ValueError("Нет утверждённых Shorts.")
+    verify_local_source(manifest, log)
     media = probe(manifest["source_path"])
     output_w, output_h = export_settings.output_size(media["width"], media["height"])
     log(f"Экспорт Shorts: {export_settings.resolution}, {output_w}x{output_h}, "
@@ -455,7 +468,9 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         srt_keep_path = None
         tmp_srt_path = None
         if subtitles_on:
-            srt_content = build_subtitles_srt(transcript, clip["start"], clip["end"])
+            srt_content, word_cues = build_subtitles_srt(
+                apply_transcript_edits(transcript, clip.get("transcript_edits")),
+                clip["start"], clip["end"], return_cues=True)
             if srt_content:
                 srt_keep_path = output_dir / (target.stem + ".srt")
                 srt_keep_path.write_text(srt_content, encoding="utf-8-sig")
@@ -467,7 +482,7 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                 fd, tmp_srt_path = tempfile.mkstemp(
                     prefix="subs_", suffix=".ass" if custom_style else ".srt", dir=str(output_dir), text=True)
                 with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
-                    f.write(build_ass(srt_content, subtitle_settings) if custom_style else srt_content)
+                    f.write(build_ass(srt_content, subtitle_settings, word_cues) if custom_style else srt_content)
                 escaped = _filtergraph_escape_path(tmp_srt_path)
                 vf_parts.append(f"subtitles='{escaped}'" if custom_style else
                                 f"subtitles='{escaped}':force_style='{LEGACY_STYLE}'")

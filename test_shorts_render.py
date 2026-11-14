@@ -11,6 +11,7 @@ from renderer import (
     SHORTS_OUTPUT_H,
     SHORTS_OUTPUT_W,
     _crop_params,
+    _crop_switch_exprs,
     _filtergraph_escape_path,
     _group_words_into_cues,
     _srt_timecode,
@@ -544,6 +545,91 @@ class RenderShortsApprovedTests(unittest.TestCase):
             self.assertEqual(len(srt_files), 1,
                              "Keep SRT file must exist with readable name")
             self.assertIn("Японская", srt_files[0].name)
+
+
+class CropSwitchExprsTests(unittest.TestCase):
+    """Tests for _crop_switch_exprs: segment selection logic and time precision."""
+
+    def _segments(self, ends, crops=None):
+        n = len(ends)
+        if crops is None:
+            crops = [
+                {"x": i * 0.2, "y": 0.0, "width": 0.3, "height": 1.0}
+                for i in range(n)
+            ]
+        segs = []
+        prev = 0.0
+        for i, end in enumerate(ends):
+            segs.append({
+                "start": prev,
+                "end": end,
+                "crop": crops[i],
+            })
+            prev = end
+        return segs
+
+    def test_two_segment_switch(self):
+        segs = self._segments([10.0, 48.52])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        # First segment crop x at x=0 (0*0.2*3840 = 0)
+        self.assertIn("0", x)
+        # Second segment crop x at x=768 (1*0.2*3840 = 768)
+        self.assertIn("768", x)
+        # Switch at t=10.0
+        self.assertIn("10.000000", x)
+        self.assertNotIn("10.0", x.replace("10.000000", ""))
+
+    def test_three_segment_switch(self):
+        segs = self._segments([16.589559, 33.580798, 48.52])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        self.assertIn("16.589559", x)
+        self.assertIn("33.580798", x)
+        # Last segment is else — no time guard
+        self.assertNotIn("48.520000", x)
+
+    def test_precision_10_032688(self):
+        """Regression: :g format truncated 10.032688 to 10.0327.
+
+        With :.6f the full 6-decimal value must survive in the expression.
+        """
+        segs = self._segments([10.032688, 48.52])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        self.assertIn("10.032688", x)
+        # Must NOT be the old truncated form
+        self.assertNotIn("10.0327", x)
+
+    def test_precision_32_910651(self):
+        """Regression: :g format truncated 32.910651 to 32.9107."""
+        segs = self._segments([10.0, 32.910651, 48.52])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        self.assertIn("32.910651", x)
+        self.assertNotIn("32.9107", x)
+
+    def test_precision_41_575306(self):
+        """Regression: :g format gave 41.5753 (6 sig figs); :.6f must give 41.575306.
+
+        The old form "41.5753" is a substring of "41.575306", so we check that
+        the time is followed by a closing paren (end of lt()), not by more digits.
+        """
+        segs = self._segments([10.0, 32.910651, 41.575306, 119.84])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        self.assertIn("41.575306", x)
+        self.assertNotIn("41.5753)", x.replace("41.575306)", ""))
+
+    def test_ffmpeg_escaping_preserved(self):
+        """The comma in lt(t, ...) must be backslash-escaped for FFmpeg."""
+        segs = self._segments([10.0, 48.52])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        self.assertIn(r"lt(t\,", x)
+
+    def test_all_expressions_same_boundaries(self):
+        """w, h, x, y must all switch at the same time boundaries."""
+        segs = self._segments([10.032688, 32.910651, 41.575306, 119.84])
+        w, h, x, y = _crop_switch_exprs(segs, 3840, 2160)
+        for expr in (w, h, x, y):
+            self.assertIn("10.032688", expr)
+            self.assertIn("32.910651", expr)
+            self.assertIn("41.575306", expr)
 
 
 class FiltergraphEscapeTests(unittest.TestCase):

@@ -1,0 +1,20 @@
+{
+  "schema_version": 3,
+  "shorts": {
+    "font": "Arial",
+    "font_size": 18.0,
+    "position_mode": "free",
+    "x": 50.0,
+    "y": 75.0,
+    "background_enabled": true,
+    "background_color": "#5b485e",
+    "background_opacity": 100.0,
+    "outline_enabled": false,
+    "outline_color": "#000000",
+    "area_enabled": true,
+    "width_percent": 100.0,
+    "height_percent": 34.383720930232556,
+    "highlight_word_enabled": true,
+    "highlight_word_color": "#a50188"
+  }
+}

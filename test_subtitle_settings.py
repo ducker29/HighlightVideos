@@ -46,14 +46,15 @@ class SettingsTests(unittest.TestCase):
 
     def test_v1_migration_preserves_style_and_v2_is_strict(self):
         old_fields = {k: v for k, v in asdict(DEFAULTS).items()
-                      if k not in {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent"}}
+                      if k not in {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent",
+                                   "highlight_word_enabled", "highlight_word_color"}}
         self.assertEqual(from_document({"schema_version": 1, "shorts": old_fields}), DEFAULTS)
         old_fields.update(position_mode="free", x=40, y=65, background_enabled=True)
         migrated = from_document({"schema_version": 1, "shorts": old_fields})
         self.assertFalse(migrated.area_enabled)
         self.assertTrue(migrated.outline_enabled)
         self.assertEqual(migrated.y, 65)
-        self.assertEqual(document(migrated)["schema_version"], 2)
+        self.assertEqual(document(migrated)["schema_version"], 3)
         with self.assertRaises(ValueError):
             from_document({"schema_version": 2, "shorts": old_fields})
 
@@ -86,6 +87,35 @@ class SettingsTests(unittest.TestCase):
         self.assertIn(r"\an5\pos(", ass)
         self.assertIn("Dialogue: 0", ass)
         self.assertIn("Dialogue: 1", ass)
+
+    def test_word_highlight_timing_gaps_and_reset(self):
+        from renderer import build_subtitles_srt
+        transcript = {"segments": [{"start": 9, "end": 13, "words": [
+            {"word": "Первое", "start": 9.8, "end": 10.5},
+            {"word": "второе", "start": 10.8, "end": 12.2}]}]}
+        srt, cues = build_subtitles_srt(transcript, 10, 12, return_cues=True)
+        settings = replace(DEFAULTS, highlight_word_enabled=True, highlight_word_color="#123456")
+        ass = build_ass(srt, settings, cues)
+        events = [line for line in ass.splitlines() if line.startswith("Dialogue: 1")]
+        self.assertEqual(len(events), 3)
+        self.assertIn("0:00:00.00,0:00:00.50", events[0])
+        self.assertIn(r"{\1c&H00563412&}Первое{\1c&HFFFFFF&} второе", events[0])
+        self.assertIn("0:00:00.50,0:00:00.80", events[1])
+        self.assertNotIn(r"\1c", events[1])
+        self.assertIn(r"Первое {\1c&H00563412&}второе{\1c&HFFFFFF&}", events[2])
+        self.assertIn("0:00:00.80,0:00:02.00", events[2])
+        self.assertNotIn(r"\1c", build_ass(srt, DEFAULTS, cues))
+
+    def test_v2_migration_and_highlight_validation(self):
+        fields = asdict(DEFAULTS)
+        fields.pop("highlight_word_enabled")
+        fields.pop("highlight_word_color")
+        self.assertEqual(from_document({"schema_version": 2, "shorts": fields}), DEFAULTS)
+        custom = replace(DEFAULTS, highlight_word_enabled=True, highlight_word_color="#123456")
+        self.assertEqual(from_document(document(custom)), custom)
+        for values in ({"highlight_word_enabled": 1}, {"highlight_word_color": "yellow"}):
+            with self.assertRaises(ValueError):
+                replace(DEFAULTS, **values)
 
 
 class WindowTests(unittest.TestCase):

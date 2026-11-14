@@ -1,6 +1,7 @@
 """Tkinter desktop UI. Workers communicate through a queue, never through widgets."""
 import copy
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -16,9 +17,11 @@ from renderer import approval_key, output_filename, render_approved, render_shor
 from clip_padding import padding_seconds, prepare_review_report, refresh_padding_overlaps, set_candidate_padding
 from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
+from transcript_editing import apply_transcript_edits
 from smart_crop_storage import create_settings, load_settings, save_settings, settings_path
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, load_settings as load_subtitle_settings, save_settings as save_subtitle_settings
 from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, load_settings as load_shorts_settings, save_settings as save_shorts_settings
+from local_source import local_source_path
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -57,12 +60,13 @@ class HighlightApp:
         if saved.exists():
             self.settings.update(load_json(saved))
         self.variables = {key: tk.StringVar(value=str(value)) for key, value in self.settings.items()}
+        self.variables.setdefault("local_video_path", tk.StringVar(value=""))
         self.variables["analyze_full_video"] = tk.BooleanVar(value=self.settings.get("analyze_full_video", True))
         # Shorts настройки
         self.variables["shorts_min_duration_sec"] = tk.StringVar(value=str(self.settings.get("shorts_min_duration_sec", 20)))
         self.variables["shorts_target_duration_sec"] = tk.StringVar(value=str(self.settings.get("shorts_target_duration_sec", 40)))
         self.variables["shorts_max_duration_sec"] = tk.StringVar(value=str(self.settings.get("shorts_max_duration_sec", 60)))
-        self.status = tk.StringVar(value="Готово. Укажите ссылку и длительность, затем запустите анализ.")
+        self.status = tk.StringVar(value="Готово. Укажите ссылку или локальный файл и длительность, затем запустите анализ.")
         self._build()
         self.start.trace_add("write", self._review_bounds_changed)
         self.end.trace_add("write", self._review_bounds_changed)
@@ -91,38 +95,48 @@ class HighlightApp:
     def _build(self):
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
-        settings = ttk.LabelFrame(outer, text="Источник и настройки", padding=8)
+        settings_container = ttk.Frame(outer)
+        settings_container.pack(fill="x")
+        self.source_settings_expanded = True
+        self.source_settings_toggle = ttk.Button(settings_container, text="▼ Источник и настройки",
+                                                   command=self.toggle_source_settings)
+        self.source_settings_toggle.pack(fill="x")
+        settings = self.source_settings_body = ttk.Frame(settings_container, padding=8)
         settings.pack(fill="x")
         settings.columnconfigure(1, weight=1)
         ttk.Label(settings, text="YouTube VOD:").grid(row=0, column=0, sticky="w")
         self.url_entry = self.entry(settings, "youtube_url", 0, 1, 65)
         self.url_entry.grid(columnspan=4)
         self.button(settings, "Вставить", self.paste_url, row=0, column=5, padx=5)
-        ttk.Label(settings, text="Длительность, секунды: от").grid(row=1, column=0, sticky="w")
-        self.entry(settings, "min_duration_sec", 1, 1)
-        ttk.Label(settings, text="до").grid(row=1, column=2)
-        self.entry(settings, "max_duration_sec", 1, 3)
-        ttk.Label(settings, text="Запас в конце, с:").grid(row=1, column=4)
-        self.entry(settings, "end_padding_sec", 1, 5, 6, values=("0", "0.5", "1"))
-        ttk.Label(settings, text="Whisper:").grid(row=2, column=0, sticky="w")
-        self.entry(settings, "asr_model", 2, 1, values=("large-v3", "medium", "small"))
-        ttk.Label(settings, text="Устройство:").grid(row=2, column=2)
-        self.entry(settings, "device", 2, 3, values=("cuda", "cpu"))
-        ttk.Label(settings, text="Язык:").grid(row=2, column=4)
-        self.entry(settings, "language", 2, 5, 6)
-        ttk.Label(settings, text="Ollama URL:").grid(row=3, column=0, sticky="w")
-        self.entry(settings, "ollama_url", 3, 1, 30)
-        ttk.Label(settings, text="LLM:").grid(row=3, column=2)
-        self.model_choice = self.entry(settings, "llm_model", 3, 3, 32, values=(self.settings["llm_model"],))
-        self.button(settings, "Обновить модели", self.refresh_models, row=3, column=4, columnspan=2, padx=5)
-        ttk.Label(settings, text="LLM-редактор:").grid(row=4, column=0, sticky="w")
-        self.editorial_choice = self.entry(settings, "editorial_model", 4, 1, 65,
+        ttk.Label(settings, text="Локальный файл (приоритет):").grid(row=1, column=0, sticky="w")
+        self.local_video_entry = self.entry(settings, "local_video_path", 1, 1, 65)
+        self.local_video_entry.grid(columnspan=4)
+        self.button(settings, "Обзор…", self.browse_local_video, row=1, column=5, padx=5)
+        ttk.Label(settings, text="Длительность, секунды: от").grid(row=2, column=0, sticky="w")
+        self.entry(settings, "min_duration_sec", 2, 1)
+        ttk.Label(settings, text="до").grid(row=2, column=2)
+        self.entry(settings, "max_duration_sec", 2, 3)
+        ttk.Label(settings, text="Запас в конце, с:").grid(row=2, column=4)
+        self.entry(settings, "end_padding_sec", 2, 5, 6, values=("0", "0.5", "1"))
+        ttk.Label(settings, text="Whisper:").grid(row=3, column=0, sticky="w")
+        self.entry(settings, "asr_model", 3, 1, values=("large-v3", "medium", "small"))
+        ttk.Label(settings, text="Устройство:").grid(row=3, column=2)
+        self.entry(settings, "device", 3, 3, values=("cuda", "cpu"))
+        ttk.Label(settings, text="Язык:").grid(row=3, column=4)
+        self.entry(settings, "language", 3, 5, 6)
+        ttk.Label(settings, text="Ollama URL:").grid(row=4, column=0, sticky="w")
+        self.entry(settings, "ollama_url", 4, 1, 30)
+        ttk.Label(settings, text="LLM:").grid(row=4, column=2)
+        self.model_choice = self.entry(settings, "llm_model", 4, 3, 32, values=(self.settings["llm_model"],))
+        self.button(settings, "Обновить модели", self.refresh_models, row=4, column=4, columnspan=2, padx=5)
+        ttk.Label(settings, text="LLM-редактор:").grid(row=5, column=0, sticky="w")
+        self.editorial_choice = self.entry(settings, "editorial_model", 5, 1, 65,
                                            values=(self.settings["editorial_model"],))
         self.editorial_choice.grid(columnspan=5)
 
         # Настройки Shorts
         shorts_settings = ttk.Frame(settings)
-        shorts_settings.grid(row=5, column=0, columnspan=6, sticky="ew", pady=4)
+        shorts_settings.grid(row=6, column=0, columnspan=6, sticky="ew", pady=4)
         self.shorts_enabled_var = tk.BooleanVar(value=self.settings.get("shorts_enabled", False))
         checkbox = ttk.Checkbutton(shorts_settings, text="Включить Shorts 9:16", variable=self.shorts_enabled_var)
         checkbox.grid(row=0, column=0, padx=(0, 12), sticky="w")
@@ -135,7 +149,7 @@ class HighlightApp:
         self.entry(shorts_settings, "shorts_max_duration_sec", 0, 6, width=6)
 
         scope = ttk.Frame(settings)
-        scope.grid(row=6, column=0, columnspan=6, sticky="ew", pady=4)
+        scope.grid(row=7, column=0, columnspan=6, sticky="ew", pady=4)
         checkbox = ttk.Checkbutton(scope, text="Анализ полного видео", variable=self.variables["analyze_full_video"])
         checkbox.grid(row=0, column=0, padx=(0, 12), sticky="w")
         self.controls.append(checkbox)
@@ -147,7 +161,7 @@ class HighlightApp:
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=8)
-        self.button(actions, "Скачать и найти кандидатов", self.analyze, row=0, column=0, padx=(0, 8))
+        self.button(actions, "Анализировать видео", self.analyze, row=0, column=0, padx=(0, 8))
         self.button(actions, "Открыть сохранённый отчёт", self.load_report, row=0, column=1, padx=8)
         self.button(actions, "Нарезать утвержденные клипы", self.render, row=0, column=2, padx=8)
         self.button(actions, "Рендер все Shorts", self.render_shorts, row=0, column=3, padx=8)
@@ -226,12 +240,13 @@ class HighlightApp:
         self.button(decisions, "Утвердить интервал", lambda: self.decide("approved"), row=0, column=1, padx=3)
         self.button(decisions, "Отклонить", lambda: self.decide("rejected"), row=0, column=2, padx=3)
         self.button(decisions, "Посмотреть интервал (FFplay)", self.preview, row=0, column=3, padx=3)
-        ttk.Label(review, text="Правки сохраняются кнопками выше. Изменённые границы требуют нового утверждения.").pack(anchor="w")
+        ttk.Label(review, text="Двойной щелчок по реплике — изменить текст. Правки сохраняются кнопками выше и требуют утверждения.").pack(anchor="w")
         self.details = tk.Text(review, height=12, wrap="word", state="disabled")
         self.details.tag_configure("context", foreground="#6b7280")
         self.details.tag_configure("marker", foreground="#1d4ed8")
         self.details.tag_configure("partial", foreground="#b45309")
         self.details.pack(fill="both", expand=True, pady=4)
+        self.details.bind("<Double-Button-1>", self.edit_transcript_sentence)
         panes.add(review, weight=3)
         log_frame = ttk.LabelFrame(panes, text="Ход выполнения", padding=4)
         self.logs = tk.Text(log_frame, height=6, wrap="word", state="disabled")
@@ -386,6 +401,21 @@ class HighlightApp:
         self.logs.see("end")
         self.logs.configure(state="disabled")
 
+    def toggle_source_settings(self):
+        self.source_settings_expanded = not self.source_settings_expanded
+        if self.source_settings_expanded:
+            self.source_settings_body.pack(fill="x")
+        else:
+            self.source_settings_body.pack_forget()
+        self.source_settings_toggle.configure(text=("▼" if self.source_settings_expanded else "▶") + " Источник и настройки")
+
+    def browse_local_video(self):
+        path = filedialog.askopenfilename(parent=self.root, title="Выберите локальный видеофайл",
+                                          filetypes=[("Видео", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.ts *.mts *.m2ts"),
+                                                     ("Все файлы", "*.*")])
+        if path:
+            self.variables["local_video_path"].set(path)
+
     def read_settings(self):
         settings = {key: variable.get().strip() for key, variable in self.variables.items() if key != "analyze_full_video"}
         settings["analyze_full_video"] = self.variables["analyze_full_video"].get()
@@ -400,8 +430,12 @@ class HighlightApp:
             raise ValueError("Укажите длительность: 1 ≤ минимум ≤ максимум ≤ 480 секунд. Обычно 120–300.")
         if settings["device"] not in ("cpu", "cuda"):
             raise ValueError("Устройство должно быть cpu или cuda.")
-        if not all(settings[k] for k in ("youtube_url", "asr_model", "llm_model", "ollama_url")):
-            raise ValueError("Заполните ссылку и названия моделей.")
+        if settings["local_video_path"]:
+            settings["local_video_path"] = str(local_source_path(settings["local_video_path"]))
+        elif not settings.get("youtube_url"):
+            raise ValueError("Укажите YouTube-ссылку или путь к локальному видеофайлу.")
+        if not all(settings[k] for k in ("asr_model", "llm_model", "ollama_url")):
+            raise ValueError("Заполните названия моделей и адрес Ollama.")
         # Shorts настройки
         if self.shorts_enabled_var.get():
             settings["outputs"] = {
@@ -430,7 +464,7 @@ class HighlightApp:
         except (ValueError, OSError) as exc:
             messagebox.showerror("Настройки", str(exc), parent=self.root)
             return
-        self.start_worker("Скачивание и смысловой анализ…", lambda: run_analysis(settings, self.log))
+        self.start_worker("Подготовка источника и смысловой анализ…", lambda: run_analysis(settings, self.log))
 
     def recalc_shorts(self):
         """Keep every existing in-range Short; discover additional candidates."""
@@ -571,6 +605,102 @@ class HighlightApp:
             self.details.insert("end", content, (tag,))
         self.details.configure(state="disabled")
 
+    def _transcript_draft_key(self, candidate):
+        return (id(self.context), self._is_shorts_tab(), candidate["candidate_id"])
+
+    def _candidate_with_text_edits(self, candidate):
+        result = dict(candidate)
+        drafts = getattr(self, "_transcript_drafts", {})
+        edits = candidate.get("transcript_edits", [])
+        if drafts:
+            edits = drafts.get(self._transcript_draft_key(candidate), edits)
+        if edits:
+            result["transcript_edits"] = copy.deepcopy(edits)
+        else:
+            result.pop("transcript_edits", None)
+        return result
+
+    def _text_edits_unsaved(self, candidate):
+        return self._candidate_with_text_edits(candidate).get("transcript_edits", []) != candidate.get("transcript_edits", [])
+
+    def edit_transcript_sentence(self, event):
+        if self.busy or not self.context:
+            return "break"
+        candidate = self.current_shorts_candidate() if self._is_shorts_tab() else self.current_candidate()
+        if not candidate:
+            return "break"
+        index = self.details.index(f"@{event.x},{event.y}")
+        line = self.details.get(f"{index} linestart", f"{index} lineend")
+        match = re.match(r"\[(\d+:\d+:\d+\.\d+)–(\d+:\d+:\d+\.\d+)\]", line)
+        if not match:
+            return "break"
+        start, end = (parse_time(value) for value in match.groups())
+        source = self.context["transcript"]
+        sentences = source.get("sentences", [])
+        matches = [(i, s) for i, s in enumerate(sentences)
+                   if s["start"] < end and s["end"] > start]
+        if not matches:
+            return "break"
+        sentence_index, sentence = max(matches, key=lambda item: min(end, item[1]["end"]) - max(start, item[1]["start"]))
+        edited = self._candidate_with_text_edits(candidate)
+        current = apply_transcript_edits(source, edited.get("transcript_edits"))
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Исправить реплику")
+        dialog.transient(self.root)
+        ttk.Label(dialog, text=f"{timecode(sentence['start'])} — {timecode(sentence['end'])}\n"
+                  "Редактируется полная реплика, включая контекст за границами клипа.").pack(padx=12, pady=8)
+        text = tk.Text(dialog, width=80, height=6, wrap="word", undo=True)
+        text.pack(fill="both", expand=True, padx=12, pady=4)
+        text.insert("1.0", current["sentences"][sentence_index]["text"])
+        menu = tk.Menu(text, tearoff=False)
+        for label, virtual in (("Вырезать", "<<Cut>>"), ("Копировать", "<<Copy>>"), ("Вставить", "<<Paste>>")):
+            menu.add_command(label=label, command=lambda v=virtual: text.event_generate(v))
+        def popup(e):
+            try:
+                menu.tk_popup(e.x_root, e.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+        text.bind("<Button-3>", popup)
+        def select_all(_):
+            text.tag_add("sel", "1.0", "end-1c")
+            return "break"
+        def shortcuts(e):
+            if e.state & 0x4 and not e.state & (0x8 | 0x20000):
+                if e.keycode == 65:
+                    return select_all(e)
+                virtual = {67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>"}.get(e.keycode)
+                if virtual:
+                    text.event_generate(virtual)
+                    return "break"
+        text.bind("<Control-KeyPress>", shortcuts)
+        def accept():
+            value = " ".join(text.get("1.0", "end-1c").split())
+            if not value:
+                messagebox.showerror("Реплика", "Текст реплики не может быть пустым.", parent=dialog)
+                return
+            edits = [e for e in edited.get("transcript_edits", []) if e["sentence_index"] != sentence_index]
+            if value != " ".join(sentence["text"].split()):
+                edits.append({"sentence_index": sentence_index, "start": sentence["start"],
+                              "end": sentence["end"], "text": value})
+            if not hasattr(self, "_transcript_drafts"):
+                self._transcript_drafts = {}
+            self._transcript_drafts[self._transcript_draft_key(candidate)] = sorted(edits, key=lambda e: e["sentence_index"])
+            dialog.destroy()
+            self.status.set("Текст изменён. Нажмите «Сохранить правки / на доработку» или «Утвердить интервал».")
+            if self._is_shorts_tab():
+                self._update_shorts_candidate_details(preserve_scroll=True)
+            else:
+                self._update_candidate_details(preserve_scroll=True)
+        actions = ttk.Frame(dialog)
+        actions.pack(pady=8)
+        ttk.Button(actions, text="Внести в правки", command=accept).pack(side="left", padx=6)
+        ttk.Button(actions, text="Отмена", command=dialog.destroy).pack(side="left", padx=6)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        dialog.grab_set()
+        text.focus_set()
+        return "break"
+
     def show_candidate(self):
         # Если активна вкладка Shorts, переключаемся на Shorts
         if self._is_shorts_tab():
@@ -607,7 +737,8 @@ class HighlightApp:
         draft_bounds = abs(start - current["start"]) > 0.000001 or abs(end - current["end"]) > 0.000001
         if draft_bounds:
             candidate["manual_bounds"] = True
-        sections = review_sections(self.context["transcript"], start, end)
+        candidate = self._candidate_with_text_edits(candidate)
+        sections = review_sections(apply_transcript_edits(self.context["transcript"], candidate.get("transcript_edits")), start, end)
         old_scroll = self.details.yview()[0] if preserve_scroll else 0
         notes = self.context.get("quality_notes", {}).get(candidate["candidate_id"], {})
         padding = candidate.get("end_padding")
@@ -631,7 +762,7 @@ class HighlightApp:
         catalog_text = f"Выбор PASS 2 (interval_id): {catalog_id}.\n" if catalog_id else ""
         if catalog_id and candidate.get("manual_bounds"):
             catalog_text += "Границы после выбора были изменены вручную.\n"
-        draft_text = "ПРЕДПРОСМОТР: изменённые границы ещё не сохранены.\n" if draft_bounds else ""
+        draft_text = "ПРЕДПРОСМОТР: правки ещё не сохранены.\n" if draft_bounds or self._text_edits_unsaved(current) else ""
         self.set_details(f"ID: {candidate['candidate_id']}\nИмя следующего файла: {output_filename(candidate, output_dir)}\n"
                          + draft_text + catalog_text + padding_text + "\n"
                          f"Почему выбран: {candidate['reason']}\n"
@@ -654,7 +785,7 @@ class HighlightApp:
             candidate["manual_bounds"] = True
         if not candidate["title"]:
             raise ValueError("Введите заголовок.")
-        return candidate
+        return self._candidate_with_text_edits(candidate)
 
     def decide(self, status):
         if self.busy:
@@ -674,6 +805,8 @@ class HighlightApp:
                                       for c in updated["candidates"]]
             save_json(self.context["report_path"], updated)
             self.context["report"] = updated
+            if getattr(self, "_transcript_drafts", {}):
+                self._transcript_drafts.pop(self._transcript_draft_key(candidate), None)
             self.refresh_table(candidate["candidate_id"])
         except (ValueError, OSError) as exc:
             messagebox.showerror("Ревью", str(exc), parent=self.root)
@@ -685,12 +818,12 @@ class HighlightApp:
             if candidate is None:
                 return False
             return (self.start.get() != timecode(candidate["start"]) or self.end.get() != timecode(candidate["end"])
-                    or self.title.get().strip() != candidate["title"])
+                    or self.title.get().strip() != candidate["title"] or self._text_edits_unsaved(candidate))
         candidate = self.current_candidate()
         if candidate is None:
             return False
         return (self.start.get() != timecode(candidate["start"]) or self.end.get() != timecode(candidate["end"])
-                or self.title.get().strip() != candidate["title"])
+                or self.title.get().strip() != candidate["title"] or self._text_edits_unsaved(candidate))
 
     def render(self, candidate_id=None):
         # Рендер работает только для хайлайтов
@@ -885,12 +1018,13 @@ class HighlightApp:
         draft_bounds = abs(start - current["start"]) > 0.000001 or abs(end - current["end"]) > 0.000001
         if draft_bounds:
             candidate["manual_bounds"] = True
-        sections = review_sections(self.context["transcript"], start, end)
+        candidate = self._candidate_with_text_edits(candidate)
+        sections = review_sections(apply_transcript_edits(self.context["transcript"], candidate.get("transcript_edits")), start, end)
         notes = self.context.get("quality_notes", {}).get(candidate["candidate_id"], {})
         qa = ""
         if notes and abs(notes["start"] - candidate["start"]) < 0.001 and abs(notes["end"] - candidate["end"]) < 0.001:
             qa = "\n\nЗАМЕЧАНИЯ:\n" + "\n".join(notes["notes"])
-        draft_text = "ПРЕДПРОСМОТР: изменённые границы ещё не сохранены.\n" if draft_bounds else ""
+        draft_text = "ПРЕДПРОСМОТР: правки ещё не сохранены.\n" if draft_bounds or self._text_edits_unsaved(current) else ""
         self.set_details(f"ID: {candidate['candidate_id']}\n"
                          f"Формат: 9:16 Shorts\n"
                          f"{draft_text}"
@@ -916,7 +1050,7 @@ class HighlightApp:
             candidate["manual_bounds"] = True
         if not candidate["title"]:
             raise ValueError("Введите заголовок.")
-        return candidate
+        return self._candidate_with_text_edits(candidate)
 
     def decide_shorts(self, status):
         """Сохраняет решение для Shorts-кандидата."""
@@ -935,6 +1069,8 @@ class HighlightApp:
             ]
             save_json(self.context["report_path"], updated)
             self.context["report"] = updated
+            if getattr(self, "_transcript_drafts", {}):
+                self._transcript_drafts.pop(self._transcript_draft_key(candidate), None)
             self.refresh_shorts_table(candidate["candidate_id"])
         except (ValueError, OSError) as exc:
             messagebox.showerror("Ревью Shorts", str(exc), parent=self.root)

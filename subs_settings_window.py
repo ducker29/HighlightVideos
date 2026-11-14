@@ -19,7 +19,9 @@ def render_preview(settings):
     srt = "1\n00:00:00,000 --> 00:00:02,000\nПример субтитров\nВторая строка\n"
     with tempfile.TemporaryDirectory(prefix="subtitle_preview_") as directory:
         path = Path(directory) / ("preview.srt" if settings == DEFAULTS else "preview.ass")
-        path.write_text(srt if settings == DEFAULTS else build_ass(srt, settings), encoding="utf-8-sig")
+        sample_words = [[{"word": word, "start": i * .5, "end": (i + 1) * .5}
+                         for i, word in enumerate(("Пример", "субтитров", "Вторая", "строка"))]]
+        path.write_text(srt if settings == DEFAULTS else build_ass(srt, settings, sample_words), encoding="utf-8-sig")
         vf = f"subtitles='{_filtergraph_escape_path(path)}'"
         if settings == DEFAULTS:
             vf += f":force_style='{LEGACY_STYLE}'"
@@ -59,7 +61,9 @@ class SubsSettingsWindow:
                   "background_opacity": "Background Opacity (%)",
                   "outline_enabled": "Обводка текста", "outline_color": "Цвет обводки",
                   "area_enabled": "Ограничить область субтитров",
-                  "width_percent": "Ширина области (%)", "height_percent": "Высота области (%)"}
+                  "width_percent": "Ширина области (%)", "height_percent": "Высота области (%)",
+                  "highlight_word_enabled": "Менять цвет текущего слова",
+                  "highlight_word_color": "Цвет текущего слова"}
         for row, (key, value) in enumerate(asdict(active).items()):
             var = tk.BooleanVar(value=value) if type(value) is bool else tk.StringVar(value=str(value))
             self.variables[key] = var
@@ -77,7 +81,7 @@ class SubsSettingsWindow:
             if key in ("x", "y", "background_opacity", "width_percent", "height_percent"):
                 ttk.Scale(frame, from_=1 if key.endswith("_percent") else 0, to=100,
                           variable=var).grid(row=row, column=2, sticky="ew")
-            if key in ("background_color", "outline_color"):
+            if key in ("background_color", "outline_color", "highlight_word_color"):
                 ttk.Button(frame, text="Выбрать цвет", command=lambda k=key: self.choose_color(k)).grid(row=row, column=2)
             self.traces.append((var, var.trace_add("write", lambda *_, k=key: self.changed(k))))
         self.status = tk.StringVar()

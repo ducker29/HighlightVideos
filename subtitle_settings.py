@@ -27,6 +27,8 @@ class SubtitleSettings:
     area_enabled: bool = False
     width_percent: float = 68.75
     height_percent: float = 100
+    highlight_word_enabled: bool = False
+    highlight_word_color: str = "#FFFF00"
 
     def __post_init__(self):
         if (not isinstance(self.font, str) or not self.font.strip()
@@ -41,10 +43,10 @@ class SubtitleSettings:
                 raise ValueError(f"{name}: требуется число от {low} до {high}.")
         if self.position_mode not in ("historical", "free"):
             raise ValueError("Неизвестный режим позиции.")
-        for name in ("background_enabled", "outline_enabled", "area_enabled"):
+        for name in ("background_enabled", "outline_enabled", "area_enabled", "highlight_word_enabled"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} должен быть boolean.")
-        for name in ("background_color", "outline_color"):
+        for name in ("background_color", "outline_color", "highlight_word_color"):
             color = getattr(self, name)
             if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
                 raise ValueError(f"{name}: цвет должен иметь вид #RRGGBB.")
@@ -59,19 +61,24 @@ LEGACY_STYLE = ("FontName=Arial,FontSize=18,PrimaryColour=&HFFFFFF&,"
 
 
 def document(settings):
-    return {"schema_version": 2, "shorts": asdict(settings)}
+    return {"schema_version": 3, "shorts": asdict(settings)}
 
 
 def from_document(value):
     if not isinstance(value, dict) or set(value) != {"schema_version", "shorts"}:
         raise ValueError("Ожидается JSON-пресет Subs Settings.")
     version = value["schema_version"]
-    if type(version) is not int or version not in (1, 2):
+    if type(version) is not int or version not in (1, 2, 3):
         raise ValueError("Неподдерживаемая версия пресета.")
     fields = value["shorts"]
     defaults = asdict(DEFAULTS)
     added_fields = {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent"}
-    expected = set(defaults) - added_fields if version == 1 else set(defaults)
+    highlight_fields = {"highlight_word_enabled", "highlight_word_color"}
+    expected = set(defaults)
+    if version < 3:
+        expected -= highlight_fields
+    if version == 1:
+        expected -= added_fields
     if not isinstance(fields, dict) or set(fields) != expected:
         raise ValueError("Неверный набор параметров субтитров.")
     return SubtitleSettings(**(defaults | fields))
@@ -129,7 +136,7 @@ def subtitle_area(settings):
     return left, top, left + width, top + height
 
 
-def build_ass(srt, settings):
+def build_ass(srt, settings, word_cues=None):
     """Style only: preserve cue timing/content, escape literal ASS control characters.
 
     Unbounded free positions retain the previous conservative text-size clamp.
@@ -157,7 +164,7 @@ def build_ass(srt, settings):
                f"0,0,0,0,100,100,0,0,3,1,0,{align},{left_margin},{right_margin},{margin},1\n\n"
                "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     events = []
-    for block in re.split(r"\r?\n\s*\r?\n", srt.strip().lstrip("\ufeff")):
+    for cue_index, block in enumerate(re.split(r"\r?\n\s*\r?\n", srt.strip().lstrip("\ufeff"))):
         lines = block.splitlines()
         if len(lines) < 3:
             continue
@@ -175,8 +182,47 @@ def build_ass(srt, settings):
             x = max(half_w, min(384 - half_w, s.x * 3.84))
             y = max(half_h, min(288 - half_h, s.y * 2.88))
             position = f"{{\\an5\\pos({x:.3f},{y:.3f})}}"
+        variants = [(_ass_time(start), _ass_time(end), text)]
+        if s.highlight_word_enabled and word_cues and cue_index < len(word_cues):
+            words = word_cues[cue_index]
+            raw = "\n".join(lines[2:])
+            searchable = raw.replace("\n", " ")
+            spans = []
+            cursor = 0
+            for word in words:
+                index = searchable.find(word["word"], cursor)
+                if index < 0:
+                    continue
+                spans.append((word, index, index + len(word["word"])))
+                cursor = index + len(word["word"])
+            def ticks(value):
+                return round(value * 100)
+            def timestamp(value):
+                hours, rest = divmod(value, 360000)
+                minutes, rest = divmod(rest, 6000)
+                seconds, centis = divmod(rest, 100)
+                return f"{hours}:{minutes:02}:{seconds:02}.{centis:02}"
+            def escape(value):
+                return value.replace("\\", "\\\\").replace("{", r"\{").replace("}", r"\}").replace("\n", r"\N")
+            if words:
+                first, last = ticks(words[0]["start"]), ticks(words[-1]["end"])
+                boundaries = sorted({first, last} | {max(first, min(last, ticks(w[key])))
+                                    for w in words for key in ("start", "end")})
+                variants = []
+                for a, b in zip(boundaries, boundaries[1:]):
+                    active = next(((i, j) for w, i, j in spans
+                                   if ticks(w["start"]) <= a < ticks(w["end"])), None)
+                    content = text
+                    if active:
+                        i, j = active
+                        color = ass_color(s.highlight_word_color, 100)
+                        content = (escape(raw[:i]) + "{\\1c" + color + "}" + escape(raw[i:j])
+                                   + r"{\1c&HFFFFFF&}" + escape(raw[j:]))
+                    variants.append((timestamp(a), timestamp(b), content))
         for layer, style in ((0, "Box"), (1, "Text")):
             if style == "Box" and not s.background_enabled:
                 continue
-            events.append(f"Dialogue: {layer},{_ass_time(start)},{_ass_time(end)},{style},,0,0,0,,{position}{text}\n")
+            parts = [(_ass_time(start), _ass_time(end), text)] if style == "Box" else variants
+            for event_start, event_end, content in parts:
+                events.append(f"Dialogue: {layer},{event_start},{event_end},{style},,0,0,0,,{position}{content}\n")
     return header + "".join(events)

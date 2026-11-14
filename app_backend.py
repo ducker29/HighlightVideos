@@ -3,6 +3,7 @@ from pathlib import Path
 
 from analyzer import analyze, list_models, ollama_request
 from downloader import download
+from local_source import local_source_path, prepare_local_source
 from job_store import analysis_bounds, load_json, save_json, timecode
 from transcriber import check_runtime, transcribe
 from editorial_review import review_report
@@ -26,6 +27,9 @@ def run_analysis(settings, log):
         raise ValueError("Нужна длительность: 1 ≤ минимум ≤ максимум ≤ 480 секунд.")
     analysis_bounds(settings)
     padding_seconds(settings.get("end_padding_sec", 0.5))
+    local_path = (settings.get("local_video_path") or "").strip()
+    if local_path:
+        local_path = str(local_source_path(local_path))
     # Fail before a large download if the selected local LLM is unavailable.
     models = list_models(settings["ollama_url"])
     required = {settings["llm_model"], settings.get("editorial_model") or settings["llm_model"]}
@@ -34,7 +38,8 @@ def run_analysis(settings, log):
         raise ValueError("Не установлены LLM: " + ", ".join(sorted(missing)) + ". Обновите список моделей Ollama.")
     log("Проверка окружения Whisper…")
     check_runtime(settings)
-    job_dir, manifest = download(settings["youtube_url"], log)
+    job_dir, manifest = (prepare_local_source(local_path, log) if local_path
+                         else download(settings["youtube_url"], log))
     state = job_dir / "state.json"
     try:
         start_sec, end_sec = analysis_bounds(settings, manifest["media"]["duration_sec"])

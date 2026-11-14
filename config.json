@@ -1,5 +1,6 @@
 {
   "youtube_url": "https://www.youtube.com/watch?v=AVbz4UzkeTw",
+  "local_video_path": "",
   "analyze_full_video": true,
   "analysis_start_min": 0,
   "analysis_end_min": 30,
