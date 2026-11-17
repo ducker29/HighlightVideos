@@ -22,6 +22,7 @@ from smart_crop_storage import create_settings, load_settings, save_settings, se
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, load_settings as load_subtitle_settings, save_settings as save_subtitle_settings
 from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, load_settings as load_shorts_settings, save_settings as save_shorts_settings
 from local_source import local_source_path
+from downloader import video_id_from_url
 
 STATUS = {"pending": "На проверке", "approved": "Утверждён", "rejected": "Отклонён"}
 
@@ -37,6 +38,7 @@ class HighlightApp:
         self._closed = False
         self.busy = False
         self.context = None
+        self.quality_window = None
         self._loading_candidate = False
         self.controls = []
         self.settings = load_json(ROOT / "config.json")
@@ -108,6 +110,8 @@ class HighlightApp:
         self.url_entry = self.entry(settings, "youtube_url", 0, 1, 65)
         self.url_entry.grid(columnspan=4)
         self.button(settings, "Вставить", self.paste_url, row=0, column=5, padx=5)
+        self.quality_button = ttk.Button(settings, text="Загрузить", command=self.open_quality_window)
+        self.quality_button.grid(row=0, column=6, padx=5)
         ttk.Label(settings, text="Локальный файл (приоритет):").grid(row=1, column=0, sticky="w")
         self.local_video_entry = self.entry(settings, "local_video_path", 1, 1, 65)
         self.local_video_entry.grid(columnspan=4)
@@ -885,6 +889,38 @@ class HighlightApp:
                                             transcript=transcript, candidate_id=candidate_id,
                                             subtitle_settings=subtitle_settings, export_settings=export_settings))
 
+    def open_quality_window(self):
+        if self.quality_window is not None and not self.quality_window.closed:
+            self.quality_window.top.deiconify()
+            self.quality_window.top.lift()
+            self.quality_window.top.focus_set()
+            return
+        url = self.variables["youtube_url"].get().strip()
+        if not url:
+            messagebox.showinfo("Качество YouTube", "Сначала вставьте YouTube-ссылку.", parent=self.root)
+            return
+        video_id = video_id_from_url(url)
+        manifest = None
+        if self.context and self.context["manifest"].get("video_id") == video_id:
+            manifest = self.context["manifest"]
+        try:
+            from quality_window import QualityDialog
+            self.quality_window = QualityDialog(self.root, url, self._on_quality_done,
+                                                root=DATA, manifest=manifest,
+                                                on_change=self._apply_quality_manifest)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Качество YouTube", str(exc), parent=self.root)
+
+    def _apply_quality_manifest(self, height, manifest):
+        if (self.context and manifest.get("source_path")
+                and self.context["manifest"].get("video_id") == manifest.get("video_id")
+                and self.context["manifest"].get("source_type") != "local"):
+            self.context["manifest"] = copy.deepcopy(manifest)
+
+    def _on_quality_done(self, height, manifest):
+        self._apply_quality_manifest(height, manifest)
+        self.quality_window = None
+
     def open_shorts_settings(self):
         if self.shorts_settings_window is not None and not self.shorts_settings_window.closed:
             self.shorts_settings_window.top.deiconify()
@@ -929,6 +965,9 @@ class HighlightApp:
             messagebox.showerror("Предпросмотр", str(exc), parent=self.root)
 
     def _close(self):
+        if self.quality_window is not None and not self.quality_window.closed and self.quality_window.busy:
+            messagebox.showinfo("Загрузка качества", "Дождитесь завершения операции в окне качества.", parent=self.root)
+            return
         if self.busy:
             messagebox.showinfo("Выполняется обработка", "Дождитесь завершения текущей операции. Промежуточные этапы сохраняются на диск.", parent=self.root)
             return
