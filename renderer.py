@@ -18,7 +18,9 @@ from smart_crop_storage import (
 )
 from transcript_review import review_sections, transcript_chunks
 from transcript_editing import apply_transcript_edits
-from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, LEGACY_STYLE, build_ass, document as subtitle_document
+from subtitle_settings import (DEFAULTS as SUBTITLE_DEFAULTS, LEGACY_STYLE,
+                               document as subtitle_document, uses_legacy_srt_style)
+from subtitle_background import MeasurementCache, prepare_ass
 from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, document as shorts_export_document
 from local_source import verify_local_source
 from shorts_framing import candidate_framing
@@ -418,6 +420,7 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
     output_dir.mkdir(parents=True, exist_ok=True)
 
     outputs = []
+    measurement_cache = None
     for clip in approved:
         log(f"Рендер Shorts {clip['candidate_id']}: {clip['title']}")
         render_settings = clip.get("render_settings") or {}
@@ -506,11 +509,24 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                         raise RuntimeError(f"SRT не создан или пуст: {srt_keep_path}")
                     # Keep the existing ASCII temporary filename and Windows
                     # filtergraph escaping for both -vf and -filter_complex.
-                    custom_style = subtitle_settings != SUBTITLE_DEFAULTS
+                    custom_style = not uses_legacy_srt_style(subtitle_settings)
                     fd, tmp_srt_path = tempfile.mkstemp(
                         prefix="subs_", suffix=".ass" if custom_style else ".srt", dir=str(output_dir), text=True)
                     with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
-                        f.write(build_ass(srt_content, subtitle_settings, word_cues) if custom_style else srt_content)
+                        if custom_style:
+                            if (subtitle_settings.background_enabled
+                                    and subtitle_settings.background_geometry_mode == "custom"
+                                    and not (subtitle_settings.area_enabled and subtitle_settings.background_fill_region)
+                                    and measurement_cache is None):
+                                measurement_cache = MeasurementCache()
+                            try:
+                                content = prepare_ass(srt_content, subtitle_settings, output_w, output_h,
+                                                      word_cues, cache=measurement_cache)
+                            except (ValueError, OSError, subprocess.SubprocessError) as exc:
+                                raise ValueError(f"Подготовка субтитров {clip['candidate_id']} не удалась: {exc}") from exc
+                        else:
+                            content = srt_content
+                        f.write(content)
                     escaped = _filtergraph_escape_path(tmp_srt_path)
                     subtitles_filter = (f"subtitles='{escaped}'" if custom_style else
                                         f"subtitles='{escaped}':force_style='{LEGACY_STYLE}'")
@@ -589,4 +605,6 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         finally:
             if tmp_srt_path and Path(tmp_srt_path).exists():
                 Path(tmp_srt_path).unlink()
+            if temporary.exists():
+                temporary.unlink()
     return outputs

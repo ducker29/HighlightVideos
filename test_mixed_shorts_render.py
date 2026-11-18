@@ -1,5 +1,6 @@
 """Renderer wiring tests using temporary files and mocked media processes."""
 import copy
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,7 +10,7 @@ import renderer
 from job_store import load_json
 from shorts_settings import ShortsSettings
 from smart_crop_storage import create_settings, save_settings, settings_path
-from subtitle_settings import SubtitleSettings
+from subtitle_settings import DEFAULTS, SubtitleSettings, build_ass, document
 
 
 def mixed_candidate():
@@ -116,6 +117,152 @@ class MixedRenderWiringTests(unittest.TestCase):
         self.assertIn("[Script Info]", content)
         self.assertNotIn("force_style=", self.commands[0][self.commands[0].index("-filter_complex") + 1])
 
+    def test_historical_legacy_and_vector_paths_preserve_original_settings(self):
+        inactive = replace(DEFAULTS, background_geometry_mode="custom", background_fill_region=True,
+                           background_padding_x_px=37, background_padding_y_px=4, background_corner_radius_px=40,
+                           background_color="#123456", background_opacity=42)
+        legacy = replace(DEFAULTS, background_enabled=True)
+        text = replace(legacy, background_geometry_mode="custom", background_padding_x_px=37,
+                       background_padding_y_px=4, background_corner_radius_px=40)
+        full = replace(text, position_mode="free", area_enabled=True, background_fill_region=True)
+        srt, cues = renderer.build_subtitles_srt(renderer.apply_transcript_edits(self.transcript, self.clip["transcript_edits"]),
+                                               self.clip["start"], self.clip["end"], return_cues=True)
+        for style, path_type in ((DEFAULTS, "srt"), (inactive, "srt"), (legacy, "legacy"),
+                                 (text, "text"), (full, "full")):
+            with self.subTest(path=path_type):
+                self.commands.clear()
+                self.subtitle_files.clear()
+                before = document(style)
+                with patch("renderer.prepare_ass", wraps=renderer.prepare_ass) as prepare, \
+                        patch("renderer.MeasurementCache", wraps=renderer.MeasurementCache) as cache, \
+                        patch("subtitle_background._measure_text", return_value=(200, 300, 400, 500)) as measure:
+                    output = self.render(subtitle_settings=style)
+                path, content = self.subtitle_files[0]
+                graph = self.commands[0][self.commands[0].index("-filter_complex")+1]
+                self.assertEqual(graph.count("subtitles="), 1)
+                if path_type == "srt":
+                    self.assertEqual(path.suffix, ".srt")
+                    self.assertEqual(content, srt)
+                    self.assertIn(renderer.LEGACY_STYLE, graph)
+                    prepare.assert_not_called()
+                else:
+                    prepare.assert_called_once()
+                    self.assertEqual(prepare.call_args.args[2:4], (720, 1280))
+                    self.assertEqual(path.suffix, ".ass")
+                    self.assertNotIn("force_style=", graph)
+                    if path_type == "legacy":
+                        self.assertEqual(content, build_ass(srt, style, cues))
+                    else:
+                        shape = next(line for line in content.splitlines() if line.startswith("Dialogue: 0"))
+                        self.assertIn(r"\p7", shape)
+                        self.assertEqual(" b " in shape, path_type == "full")
+                        self.assertIn("0:00:00.75,0:00:03.75", shape)
+                self.assertEqual(measure.call_count, 1 if path_type == "text" else 0)
+                self.assertEqual(cache.call_count, 1 if path_type == "text" else 0)
+                self.assertEqual(document(style), before)
+                self.assertEqual(load_json(Path(output[0]).with_suffix(".json"))["subtitles"]["style"], before)
+                self.assertFalse(path.exists())
+
+    def test_vector_preparation_receives_actual_resolution_for_every_layout(self):
+        full = replace(DEFAULTS, background_enabled=True, background_geometry_mode="custom",
+                       area_enabled=True, position_mode="free", background_fill_region=True)
+        for resolution in ("720p", "1080p", "original"):
+            self.export = ShortsSettings(resolution=resolution)
+            expected = self.export.output_size(640, 360)
+            for layout in ("ordinary", "CROP", "FIT_BLUR", "mixed", "smart", "smart_mixed"):
+                with self.subTest(resolution=resolution, layout=layout):
+                    self.commands.clear()
+                    self.subtitle_files.clear()
+                    self.clip["render_settings"].pop("framing", None)
+                    if layout != "ordinary" and layout != "smart":
+                        interval = {"start": 0, "end": 4, "mode": "CROP" if layout == "CROP" else "FIT_BLUR"}
+                        if layout in ("mixed", "smart_mixed"):
+                            interval.update(start=1, end=3)
+                        self.clip["render_settings"]["framing"] = {"schema_version": 1, "default_mode": "CROP",
+                                                                  "intervals": [interval]}
+                    self.reapprove()
+                    smart = None
+                    if layout.startswith("smart"):
+                        smart = settings_path(self.job, "test", "sc001")
+                        save_settings(create_settings("sc001", 1.25, 5.25, 640, 360), smart)
+                    try:
+                        with patch("renderer.prepare_ass", wraps=renderer.prepare_ass) as prepare, \
+                                patch("subtitle_background._measure_text", side_effect=AssertionError("No measurement")):
+                            self.render(subtitle_settings=full)
+                        self.assertEqual(prepare.call_args.args[2:4], expected)
+                        command = self.commands[0]
+                        option = "-filter_complex" if layout in ("FIT_BLUR", "mixed", "smart_mixed") else "-vf"
+                        graph = command[command.index(option)+1]
+                        self.assertEqual(graph.count("subtitles="), 1)
+                        if option == "-filter_complex":
+                            self.assertIn("[framing_composed]subtitles=", graph)
+                        else:
+                            self.assertIn(f"scale={expected[0]}:{expected[1]},subtitles=", graph)
+                    finally:
+                        if smart is not None:
+                            smart.unlink()
+
+    def test_repeated_cues_share_existing_measurement_cache_across_export_batch(self):
+        second = copy.deepcopy(self.clip)
+        second["candidate_id"] = "sc002"
+        second["approval_key"] = renderer.shorts_approval_key(second)
+        self.report["shorts_candidates"].append(second)
+        text = replace(DEFAULTS, background_enabled=True, background_geometry_mode="custom")
+        with patch("subtitle_background._measure_text", return_value=(100, 200, 300, 400)) as measure, \
+                patch("renderer.prepare_ass", wraps=renderer.prepare_ass) as prepare, \
+                patch("renderer.MeasurementCache", wraps=renderer.MeasurementCache) as cache:
+            output = self.render(subtitle_settings=text)
+        self.assertEqual(len(output), 2)
+        self.assertEqual(prepare.call_count, 2)
+        self.assertIs(prepare.call_args_list[0].kwargs["cache"], prepare.call_args_list[1].kwargs["cache"])
+        measure.assert_called_once()
+        cache.assert_called_once()
+
+    def test_preparation_failure_is_not_replaced_with_legacy_and_cleans_ass(self):
+        text = replace(DEFAULTS, background_enabled=True, background_geometry_mode="custom")
+        with patch("subtitle_background._measure_text", side_effect=ValueError("measurement failure")):
+            with self.assertRaisesRegex(ValueError, "Подготовка субтитров sc001.*measurement failure"):
+                self.render(subtitle_settings=text)
+        self.assertFalse(self.commands)
+        self.assertFalse(list(self.job.rglob("subs_*")))
+        self.assertFalse(list(self.job.rglob("*.mp4")))
+
+    def test_diagnostic_failure_removes_diagnostic_directory_and_export_ass(self):
+        original = tempfile.TemporaryDirectory
+        directories = []
+
+        def diagnostic_directory(*args, **kwargs):
+            directory = original(*args, **kwargs)
+            directories.append(Path(directory.name))
+            return directory
+
+        text = replace(DEFAULTS, background_enabled=True, background_geometry_mode="custom")
+        with patch("renderer.probe", return_value=self.media), \
+                patch("subtitle_background.tempfile.TemporaryDirectory", side_effect=diagnostic_directory), \
+                patch("renderer.subprocess.run", return_value=Mock(returncode=1, stdout=b"", stderr=b"libass failure")):
+            with self.assertRaisesRegex(ValueError, "sc001.*libass failure"):
+                renderer.render_shorts_approved(self.manifest, self.report, self.job, lambda _: None,
+                                               transcript=self.transcript, subtitle_settings=text)
+        self.assertEqual(len(directories), 1)
+        self.assertTrue(all(not path.exists() for path in directories))
+        self.assertFalse(list(self.job.rglob("subs_*")))
+        self.assertFalse(list(self.job.rglob("*.mp4")))
+
+    def test_ffmpeg_failure_removes_partial_mp4_and_ass(self):
+        full = replace(DEFAULTS, background_enabled=True, background_geometry_mode="custom", background_fill_region=True,
+                       area_enabled=True, position_mode="free")
+
+        def failure(command, **kwargs):
+            self.fake_run(command, **kwargs)
+            return Mock(returncode=1)
+
+        with patch("renderer.probe", return_value=self.media), patch("renderer.subprocess.run", side_effect=failure):
+            with self.assertRaisesRegex(RuntimeError, "FFmpeg.*sc001"):
+                renderer.render_shorts_approved(self.manifest, self.report, self.job, lambda _: None,
+                                               transcript=self.transcript, subtitle_settings=full)
+        self.assertFalse(list(self.job.rglob("subs_*")))
+        self.assertFalse(list(self.job.rglob("*.mp4")))
+
     def test_disabled_or_empty_subtitles_omit_filter_and_tempfile(self):
         for disabled in (True, False):
             with self.subTest(disabled=disabled):
@@ -195,6 +342,7 @@ class MixedRenderWiringTests(unittest.TestCase):
             self.render()
         self.assertFalse([path for path in self.job.rglob("*.mp4") if ".partial." not in path.name])
         self.assertFalse(list(self.job.rglob("subs_*")))
+        self.assertFalse(list(self.job.rglob("*.partial.mp4")))
 
     def test_stale_framing_and_changed_approval_rejected_before_ffmpeg(self):
         original = copy.deepcopy(self.clip)

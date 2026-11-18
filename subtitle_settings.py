@@ -8,7 +8,7 @@ import math
 import os
 import re
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 
@@ -29,6 +29,11 @@ class SubtitleSettings:
     height_percent: float = 100
     highlight_word_enabled: bool = False
     highlight_word_color: str = "#FFFF00"
+    background_padding_x_px: float = 0
+    background_padding_y_px: float = 0
+    background_corner_radius_px: float = 0
+    background_geometry_mode: str = "legacy"
+    background_fill_region: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.font, str) or not self.font.strip()
@@ -36,16 +41,25 @@ class SubtitleSettings:
             raise ValueError("Некорректное семейство шрифта.")
         for name, low, high in (("font_size", 1, 144), ("x", 0, 100),
                                 ("y", 0, 100), ("background_opacity", 0, 100),
-                                ("width_percent", 1, 100), ("height_percent", 1, 100)):
+                                ("width_percent", 1, 100), ("height_percent", 1, 100),
+                                ("background_padding_x_px", 0, 512),
+                                ("background_padding_y_px", 0, 512),
+                                ("background_corner_radius_px", 0, 512)):
             value = getattr(self, name)
-            if (type(value) not in (float, int) or not math.isfinite(value)
-                    or not low <= value <= high):
+            if (type(value) not in (float, int) or not low <= value <= high
+                    or not math.isfinite(value)):
                 raise ValueError(f"{name}: требуется число от {low} до {high}.")
         if self.position_mode not in ("historical", "free"):
             raise ValueError("Неизвестный режим позиции.")
-        for name in ("background_enabled", "outline_enabled", "area_enabled", "highlight_word_enabled"):
+        if (not isinstance(self.background_geometry_mode, str)
+                or self.background_geometry_mode not in ("legacy", "custom")):
+            raise ValueError("background_geometry_mode: требуется legacy или custom.")
+        for name in ("background_enabled", "outline_enabled", "area_enabled", "highlight_word_enabled",
+                     "background_fill_region"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} должен быть boolean.")
+        if self.background_fill_region and self.background_geometry_mode == "legacy":
+            raise ValueError("background_fill_region=True требует background_geometry_mode=custom.")
         for name in ("background_color", "outline_color", "highlight_word_color"):
             color = getattr(self, name)
             if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
@@ -61,20 +75,26 @@ LEGACY_STYLE = ("FontName=Arial,FontSize=18,PrimaryColour=&HFFFFFF&,"
 
 
 def document(settings):
-    return {"schema_version": 3, "shorts": asdict(settings)}
+    return {"schema_version": 5, "shorts": asdict(settings)}
 
 
 def from_document(value):
     if not isinstance(value, dict) or set(value) != {"schema_version", "shorts"}:
         raise ValueError("Ожидается JSON-пресет Subs Settings.")
     version = value["schema_version"]
-    if type(version) is not int or version not in (1, 2, 3):
+    if type(version) is not int or version not in (1, 2, 3, 4, 5):
         raise ValueError("Неподдерживаемая версия пресета.")
     fields = value["shorts"]
     defaults = asdict(DEFAULTS)
     added_fields = {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent"}
     highlight_fields = {"highlight_word_enabled", "highlight_word_color"}
+    geometry_fields = {"background_padding_x_px", "background_padding_y_px",
+                       "background_corner_radius_px", "background_geometry_mode"}
     expected = set(defaults)
+    if version < 5:
+        expected.remove("background_fill_region")
+    if version < 4:
+        expected -= geometry_fields
     if version < 3:
         expected -= highlight_fields
     if version == 1:
@@ -82,6 +102,43 @@ def from_document(value):
     if not isinstance(fields, dict) or set(fields) != expected:
         raise ValueError("Неверный набор параметров субтитров.")
     return SubtitleSettings(**(defaults | fields))
+
+
+def effective_style(settings):
+    """Return a comparison-only style with inactive options reset to defaults.
+
+    Keep the original settings for editing and persistence: hidden values are
+    retained there. Legacy box geometry ignores all custom pixel dimensions.
+    This helper does not enable custom rendering or alter generated ASS.
+    """
+    inactive = set()
+    if not settings.background_enabled:
+        inactive.update(("background_color", "background_opacity", "background_geometry_mode", "background_fill_region"))
+    if not settings.background_enabled or settings.background_geometry_mode == "legacy":
+        inactive.update(("background_padding_x_px", "background_padding_y_px", "background_corner_radius_px",
+                         "background_fill_region"))
+    elif settings.area_enabled and settings.background_fill_region:
+        inactive.update(("background_padding_x_px", "background_padding_y_px"))
+    else:
+        inactive.update(("background_corner_radius_px", "background_fill_region"))
+    if not settings.outline_enabled:
+        inactive.add("outline_color")
+    if not settings.area_enabled:
+        inactive.update(("width_percent", "height_percent"))
+    if settings.position_mode == "historical":
+        inactive.update(("x", "y"))
+    if not settings.highlight_word_enabled:
+        inactive.add("highlight_word_color")
+    return replace(settings, **{key: getattr(DEFAULTS, key) for key in inactive})
+
+
+def uses_legacy_srt_style(settings):
+    """Whether the effective style permits the historical SRT/force_style path.
+
+    Shared model predicate for future preview/renderer integration. An enabled
+    legacy background still needs ASS; legacy geometry is not the SRT default.
+    """
+    return effective_style(settings) == effective_style(DEFAULTS)
 
 
 def load_settings(path):
