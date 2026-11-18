@@ -21,6 +21,8 @@ from transcript_editing import apply_transcript_edits
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, LEGACY_STYLE, build_ass, document as subtitle_document
 from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, document as shorts_export_document
 from local_source import verify_local_source
+from shorts_framing import candidate_framing
+from shorts_filtergraph import build_shorts_filtergraph
 
 
 def approval_key(candidate):
@@ -51,6 +53,8 @@ def shorts_approval_key(candidate):
     }
     if candidate.get("transcript_edits"):
         payload["transcript_edits"] = candidate["transcript_edits"]
+    if "framing" in render:
+        payload["framing"] = candidate_framing(candidate)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
                                      allow_nan=False).encode("utf-8")).hexdigest()
 
@@ -368,6 +372,20 @@ def _probe_basic(path):
     }
 
 
+def _shorts_source_sar(media):
+    """ffprobe uses N/A or 0:1 for unspecified SAR; match probe's 1:1 fallback."""
+    raw = media.get("sample_aspect_ratio")
+    if raw in (None, "", "N/A", "0:1"):
+        return (1, 1)
+    try:
+        numerator, denominator = (int(part) for part in raw.split(":"))
+        if numerator <= 0 or denominator <= 0:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Некорректный SAR исходника: {raw!r}.") from exc
+    return numerator, denominator
+
+
 def render_shorts_approved(manifest, report, job_dir, log, transcript=None, candidate_id=None,
                            subtitle_settings=None, export_settings=None):
     """Рендер утверждённых Shorts 9:16 с crop и необязательными субтитрами."""
@@ -407,12 +425,16 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         crop_x_raw = render_settings.get("crop_x")
         crop_x = validate_crop_x(crop_x_raw)
         subtitles_on = render_settings.get("subtitles_enabled", True)
+        framing = candidate_framing(clip)
+        mixed = bool(framing["intervals"])
+        source_sar = _shorts_source_sar(media) if mixed else None
 
         # Приоритет: сохранённый Smart Crop (один или несколько сегментов),
         # иначе — стандартное центрированное кадрирование по crop_mode/crop_x.
         smart_crop_file = _smart_crop_file(job_dir, report, clip)
         segments = None
         crop_meta = None
+        settings = None
         if smart_crop_file is not None:
             try:
                 settings, warnings = load_smart_crop_settings(smart_crop_file)
@@ -449,7 +471,11 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
         target = output_dir / output_filename(clip, output_dir)
         temporary = target.with_suffix(".partial.mp4")
 
-        if segments is not None:
+        if mixed and segments is not None:
+            # Static branches in the generator handle changing zoom. Never
+            # invoke the legacy dynamic crop.w/h expressions on this path.
+            vf_parts = []
+        elif segments is not None:
             if len(segments) == 1:
                 cw, ch, cx, cy = crop_meta[0]
                 crop_part = f"crop={cw}:{ch}:{cx}:{cy}"
@@ -467,42 +493,54 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
             ]
         srt_keep_path = None
         tmp_srt_path = None
-        if subtitles_on:
-            srt_content, word_cues = build_subtitles_srt(
-                apply_transcript_edits(transcript, clip.get("transcript_edits")),
-                clip["start"], clip["end"], return_cues=True)
-            if srt_content:
-                srt_keep_path = output_dir / (target.stem + ".srt")
-                srt_keep_path.write_text(srt_content, encoding="utf-8-sig")
-                if not srt_keep_path.exists() or not srt_keep_path.stat().st_size:
-                    raise RuntimeError(f"SRT не создан или пуст: {srt_keep_path}")
-                # Временный SRT с коротким ASCII-именем в том же каталоге,
-                # чтобы FFmpeg subtitles-фильтр точно находил файл.
-                custom_style = subtitle_settings != SUBTITLE_DEFAULTS
-                fd, tmp_srt_path = tempfile.mkstemp(
-                    prefix="subs_", suffix=".ass" if custom_style else ".srt", dir=str(output_dir), text=True)
-                with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
-                    f.write(build_ass(srt_content, subtitle_settings, word_cues) if custom_style else srt_content)
-                escaped = _filtergraph_escape_path(tmp_srt_path)
-                vf_parts.append(f"subtitles='{escaped}'" if custom_style else
-                                f"subtitles='{escaped}':force_style='{LEGACY_STYLE}'")
-
-        vf = ",".join(vf_parts)
-        duration = clip["end"] - clip["start"]
-        command = [
-            "ffmpeg", "-v", "error", "-y",
-            "-ss", str(clip["start"]), "-i", manifest["source_path"],
-            "-t", str(duration),
-            "-map", "0:v:0", "-map", "0:a:0",
-            "-vf", vf,
-            "-c:v", "libx264", "-crf", str(export_settings.crf), "-preset", "slow",
-            "-fps_mode", "passthrough",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            str(temporary),
-        ]
-        log_path = target.with_suffix(".ffmpeg.log")
         try:
+            subtitles_filter = None
+            if subtitles_on:
+                srt_content, word_cues = build_subtitles_srt(
+                    apply_transcript_edits(transcript, clip.get("transcript_edits")),
+                    clip["start"], clip["end"], return_cues=True)
+                if srt_content:
+                    srt_keep_path = output_dir / (target.stem + ".srt")
+                    srt_keep_path.write_text(srt_content, encoding="utf-8-sig")
+                    if not srt_keep_path.exists() or not srt_keep_path.stat().st_size:
+                        raise RuntimeError(f"SRT не создан или пуст: {srt_keep_path}")
+                    # Keep the existing ASCII temporary filename and Windows
+                    # filtergraph escaping for both -vf and -filter_complex.
+                    custom_style = subtitle_settings != SUBTITLE_DEFAULTS
+                    fd, tmp_srt_path = tempfile.mkstemp(
+                        prefix="subs_", suffix=".ass" if custom_style else ".srt", dir=str(output_dir), text=True)
+                    with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+                        f.write(build_ass(srt_content, subtitle_settings, word_cues) if custom_style else srt_content)
+                    escaped = _filtergraph_escape_path(tmp_srt_path)
+                    subtitles_filter = (f"subtitles='{escaped}'" if custom_style else
+                                        f"subtitles='{escaped}':force_style='{LEGACY_STYLE}'")
+                    vf_parts.append(subtitles_filter)
+
+            duration = clip["end"] - clip["start"]
+            # Input -ss uses FFmpeg's default accurate seek, with copyts OFF:
+            # timestamps of BOTH streams are translated to the selected input
+            # origin. Keep any first-frame/audio offset; no independent setpts,
+            # asetpts, concat or shortest. The graph inherits these local PTS.
+            if mixed:
+                plan = build_shorts_filtergraph(
+                    clip, media["width"], media["height"], export_settings=export_settings,
+                    smart_crop=settings, source_sar=source_sar, subtitles_filter=subtitles_filter)
+                video_options = ["-map", f"[{plan.output_label}]", "-map", "0:a:0",
+                                 "-filter_complex", plan.filter_complex]
+            else:
+                video_options = ["-map", "0:v:0", "-map", "0:a:0", "-vf", ",".join(vf_parts)]
+            command = [
+                "ffmpeg", "-v", "error", "-y",
+                "-ss", str(clip["start"]), "-i", manifest["source_path"],
+                "-t", str(duration),
+                *video_options,
+                "-c:v", "libx264", "-crf", str(export_settings.crf), "-preset", "slow",
+                "-fps_mode", "passthrough",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                str(temporary),
+            ]
+            log_path = target.with_suffix(".ffmpeg.log")
             with log_path.open("w", encoding="utf-8") as stderr:
                 result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=stderr)
             if result.returncode:
@@ -516,6 +554,8 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
             if abs(rendered["duration_sec"] - duration) > 0.3:
                 raise RuntimeError(
                     f"Длительность Shorts {clip['candidate_id']} не соответствует утверждённому интервалу.")
+            if mixed and not rendered.get("has_audio"):
+                raise RuntimeError(f"Смешанный Shorts {clip['candidate_id']} получился без аудиопотока.")
             temporary.rename(target)
             if segments is not None:
                 crop_meta_out = {
@@ -541,7 +581,8 @@ def render_shorts_approved(manifest, report, job_dir, log, transcript=None, cand
                 "crop": crop_meta_out,
                 "subtitles": {"enabled": subtitles_on, "style": subtitle_document(subtitle_settings)},
                 "export_settings": {**shorts_export_document(export_settings), "crf": export_settings.crf,
-                                    "output_width": output_w, "output_height": output_h},
+                                     "output_width": output_w, "output_height": output_h},
+                **({"framing": framing} if "framing" in render_settings else {}),
             })
             outputs.append(str(target))
             log(f"Сохранено: {target}")

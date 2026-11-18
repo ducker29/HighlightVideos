@@ -24,6 +24,10 @@ def load_json(path):
 
 def save_json(path, value):
     path = Path(path)
+    if isinstance(value, dict) and "shorts_candidates" in value and "candidates" in value:
+        from shorts_framing import validate_report_framing
+        previous = load_json(path) if path.exists() else None
+        validate_report_framing(value, previous)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")

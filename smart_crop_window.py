@@ -365,6 +365,7 @@ class SmartCropWindow(ttk.Frame):
         self.info_label.pack(side="right")
 
         row = ttk.Frame(self)
+        self._image_frame = row
         row.pack(fill="both", expand=True, padx=4, pady=2)
         self.source_canvas = tk.Canvas(row, width=SOURCE_W, height=SOURCE_H,
                                        bg="black", highlightthickness=0)
@@ -381,6 +382,7 @@ class SmartCropWindow(ttk.Frame):
         self.preview_canvas.pack(side="right", fill="both", expand=False, padx=(8, 0))
 
         bottom = ttk.Frame(self)
+        self._transport_frame = bottom
         bottom.pack(fill="x", padx=8, pady=6)
         btns = ttk.Frame(bottom)
         btns.pack(side="left", fill="x", expand=True)
@@ -388,7 +390,8 @@ class SmartCropWindow(ttk.Frame):
         self.play_btn.pack(side="left", padx=2)
         ttk.Button(btns, text="⏮ кадр", command=lambda: self.step_frame(-1)).pack(side="left", padx=2)
         ttk.Button(btns, text="кадр ⏭", command=lambda: self.step_frame(1)).pack(side="left", padx=2)
-        ttk.Button(btns, text="Сбросить crop", command=self.reset_crop).pack(side="left", padx=2)
+        self.reset_crop_button = ttk.Button(btns, text="Сбросить crop", command=self.reset_crop)
+        self.reset_crop_button.pack(side="left", padx=2)
         ttk.Button(btns, text="Разделить", command=self.split_current_segment).pack(side="left", padx=2)
         ttk.Button(btns, text="Объединить со следующим", command=self.merge_current_segment).pack(side="left", padx=2)
         self.crop_label = ttk.Label(btns, text="")
@@ -406,6 +409,48 @@ class SmartCropWindow(ttk.Frame):
         self.timeline_canvas.bind("<ButtonPress-1>", self._on_timeline_click)
         self.timeline_canvas.bind("<Configure>", lambda _e: self._draw_timeline())
         self._draw_timeline()
+
+    def configure_framing(self, framing, on_save):
+        """Attach report-backed framing without changing the Smart Crop document."""
+        from framing_panel import FramingPanel
+        self._framing_frame_time = None
+        self.framing_panel = FramingPanel(self, framing, self.duration, self._current_time,
+                                          self._framing_changed, on_save)
+        # Reserve controls first; the large requested preview height must not
+        # push the transport or timeline outside a normal 1180x760 window.
+        self._image_frame.pack_forget()
+        self._transport_frame.pack_forget()
+        self.timeline_canvas.pack_forget()
+        self.timeline_canvas.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
+        self._transport_frame.pack(side="bottom", fill="x", padx=8, pady=6)
+        self.framing_panel.pack(side="bottom", fill="x", padx=8, pady=4)
+        self._image_frame.pack(fill="both", expand=True, padx=4, pady=2)
+        self.preview_canvas.bind("<Configure>", lambda _event: self._refresh_preview())
+        self._framing_changed()
+
+    def _framing_mode(self, time=None):
+        from framing_panel import framing_mode_at
+        panel = getattr(self, "framing_panel", None)
+        return framing_mode_at(panel.draft, self._current_time() if time is None else time) if panel is not None else "CROP"
+
+    def _framing_changed(self):
+        self._drag = None
+        self._sync_framing_state()
+        self._draw_timeline()
+        self._refresh_preview()
+
+    def _sync_framing_state(self):
+        panel = getattr(self, "framing_panel", None)
+        if panel is None:
+            return
+        mode = self._framing_mode()
+        panel.mode_var.set(f"Курсор: {mode}")
+        self.reset_crop_button.configure(state="disabled" if mode == "FIT_BLUR" else "normal")
+        if self._crop_rect_id is not None:
+            self.source_canvas.itemconfigure(self._crop_rect_id, state="hidden" if mode == "FIT_BLUR" else "normal")
+        if mode == "FIT_BLUR":
+            self._drag = None
+            self.source_canvas.configure(cursor="")
 
     # -- playback state --------------------------------------------------- #
     def _current_time(self):
@@ -450,6 +495,9 @@ class SmartCropWindow(ttk.Frame):
             self._selected_segment = index
         self._request_frame(t)
         self._update_timeline()
+        if getattr(self, "framing_panel", None) is not None:
+            self._sync_framing_state()
+            self._refresh_preview()
 
     def _set_time(self, t):
         """Update timeline, timecode and frame without treating it as a user seek."""
@@ -548,6 +596,8 @@ class SmartCropWindow(ttk.Frame):
             self._displayed_frame_local_time = (
                 frame_time - self.start if frame_time is not None else None
             )
+            if getattr(self, "framing_panel", None) is not None:
+                self._framing_frame_time = self._displayed_frame_local_time
             self._render(arr)
         elif kind == "frame_failed":
             if event[1] == self._seq:
@@ -644,6 +694,7 @@ class SmartCropWindow(ttk.Frame):
             return
         x, y, w, h = self._crop_box_canvas()
         self.source_canvas.coords(self._crop_rect_id, x, y, x + w, y + h)
+        self._sync_framing_state()
 
     def _update_crop_label(self):
         if self._crop_label is None:
@@ -705,6 +756,8 @@ class SmartCropWindow(ttk.Frame):
         return nx, ny, nw, nh
 
     def _commit_crop(self, normalized):
+        if self._framing_mode() == "FIT_BLUR":
+            return
         index = self._current_segment_index()
         if index < 0:
             return
@@ -722,6 +775,8 @@ class SmartCropWindow(ttk.Frame):
         return clamp_box_in_area(x, y, ww, hh, self._source_display)
 
     def _on_drag_start(self, event):
+        if self._framing_mode() == "FIT_BLUR":
+            return
         if self._source_display is None:
             return
         x, y, w, h = self._crop_box_canvas()
@@ -731,6 +786,8 @@ class SmartCropWindow(ttk.Frame):
             self.source_canvas.configure(cursor="fleur")
 
     def _on_drag_move(self, event):
+        if self._framing_mode() == "FIT_BLUR":
+            return
         if not self._drag:
             return
         dx, dy = self._drag
@@ -750,6 +807,8 @@ class SmartCropWindow(ttk.Frame):
             self.source_canvas.configure(cursor="")
 
     def _on_zoom(self, event):
+        if self._framing_mode() == "FIT_BLUR":
+            return
         if self._source_display is None:
             return
         delta = event.delta if hasattr(event, "delta") else (1 if getattr(event, "num", 0) < 0 else -1)
@@ -780,6 +839,16 @@ class SmartCropWindow(ttk.Frame):
             from PIL import Image, ImageTk
         except Exception:
             return
+        frame_time = getattr(self, "_framing_frame_time", None)
+        if self._framing_mode(frame_time) == "FIT_BLUR":
+            from framing_panel import fit_blur_preview
+            pcw, pch = self._preview_canvas_size()
+            size = fit_size(9, 16, pcw, pch)
+            preview = fit_blur_preview(Image.fromarray(self._frame_cached), size)
+            self._preview_image = ImageTk.PhotoImage(preview)
+            self.preview_canvas.delete("all")
+            self.preview_canvas.create_image(pcw // 2, pch // 2, image=self._preview_image, anchor="center")
+            return
         seg = self._current_segment()
         if not seg:
             return
@@ -800,6 +869,8 @@ class SmartCropWindow(ttk.Frame):
         self.preview_canvas.create_image(cx, cy, image=self._preview_image, anchor="center")
 
     def reset_crop(self):
+        if self._framing_mode() == "FIT_BLUR":
+            return
         index = self._current_segment_index()
         if index < 0:
             return
@@ -942,6 +1013,12 @@ class SmartCropWindow(ttk.Frame):
                 canvas.create_text((x1 + x2) / 2, height / 2, text=str(i + 1),
                                    fill="#ffffff")
         self._timeline_rect_ids = rect_ids
+        panel = getattr(self, "framing_panel", None)
+        if panel is not None:
+            for item in panel.draft["intervals"]:
+                canvas.create_rectangle(item["start"] / duration * width, height - 9,
+                                        item["end"] / duration * width, height - 2,
+                                        fill="#d89435", outline="", tags="fit_blur")
         t = float(self.slider.get())
         px = min(max(t / duration, 0.0), 1.0) * width
         canvas.create_line(px, 0, px, height, fill="#ff5555", width=2,
@@ -960,6 +1037,12 @@ class SmartCropWindow(ttk.Frame):
 
     def _on_timeline_click(self, event):
         width = max(1, int(self.timeline_canvas.winfo_width()))
+        if (getattr(self, "framing_panel", None) is not None
+                and TIMELINE_H - 9 <= event.y <= TIMELINE_H - 2):
+            self._playing = False
+            self.play_btn.configure(text="▶ Play")
+            self._set_time(max(0.0, min(1.0, event.x / width)) * self.duration)
+            return
         index = timeline_segment_at(
             self.settings["segments"], self.duration, event.x, width)
         if index < 0:

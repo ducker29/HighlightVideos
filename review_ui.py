@@ -19,6 +19,7 @@ from ui_editing import install_editing
 from transcript_review import review_sections, transcript_chunks
 from transcript_editing import apply_transcript_edits
 from smart_crop_storage import create_settings, load_settings, save_settings, settings_path
+from shorts_framing import candidate_framing, save_candidate_framing
 from subtitle_settings import DEFAULTS as SUBTITLE_DEFAULTS, load_settings as load_subtitle_settings, save_settings as save_subtitle_settings
 from shorts_settings import DEFAULTS as SHORTS_DEFAULTS, load_settings as load_shorts_settings, save_settings as save_shorts_settings
 from local_source import local_source_path
@@ -1179,6 +1180,8 @@ class HighlightApp:
                                            media["width"], media["height"])
             start = float(candidate["start"])
             end = float(candidate["end"])
+            framing = candidate_framing(candidate)
+            report_path = Path(self.context["report_path"]).resolve()
             top = tk.Toplevel(self.root)
             top.title(f"Смарт-кроп — {candidate['candidate_id']}")
             top.geometry("1180x760")
@@ -1187,7 +1190,9 @@ class HighlightApp:
             frame.pack(fill="both", expand=True)
             from smart_crop_window import SmartCropWindow
             editor = SmartCropWindow(frame, source_path, start, end,
-                                     candidate["candidate_id"], settings, own_toplevel=False)
+                                      candidate["candidate_id"], settings, own_toplevel=False)
+            editor.configure_framing(framing, lambda draft: self._save_smart_crop_framing(
+                report_path, candidate["candidate_id"], start, end, draft))
             editor.pack(fill="both", expand=True)
             top.smart_crop_candidate_id = candidate["candidate_id"]
             top.smart_crop_settings = settings
@@ -1201,9 +1206,31 @@ class HighlightApp:
                     w.destroy()
             messagebox.showerror("Смарт-кроп", f"Не удалось открыть окно умного кропа:\n{exc}", parent=self.root)
 
+    def _save_smart_crop_framing(self, report_path, candidate_id, start, end, framing):
+        """Save only framing; refresh the in-memory report after atomic success."""
+        if self.busy:
+            raise ValueError("Дождитесь завершения текущей операции.")
+        if not self.context or Path(self.context["report_path"]).resolve() != report_path:
+            raise ValueError("Открыт другой отчёт. Откройте редактор кадрирования заново.")
+        current = next((c for c in self.context["report"].get("shorts_candidates", [])
+                        if c["candidate_id"] == candidate_id), None)
+        if current is None or (current["start"], current["end"]) != (start, end):
+            raise ValueError("Границы Shorts изменились. Откройте редактор кадрирования заново.")
+        if self.has_unsaved_edits():
+            raise ValueError("Сначала сохраните правки кандидата в главном окне.")
+        updated = save_candidate_framing(report_path, candidate_id, framing,
+                                        expected_start=start, expected_end=end)
+        self.context["report"] = updated
+        self.refresh_shorts_table()
+
     def _close_smart_crop(self, window, path, editor):
         """Сохранить settings, остановить декодер и уничтожить Toplevel."""
         try:
+            panel = getattr(editor, "framing_panel", None)
+            if panel is not None and panel.dirty and not messagebox.askyesno(
+                    "Несохранённый framing", "Закрыть без сохранения framing?\n"
+                    "Изменения Smart Crop сохранятся отдельно.", parent=window):
+                return
             # Не сохраняем настройки для устаревших границ, если отчёт изменился
             # пока редактор был открыт.
             current = next((c for c in self.context["report"].get("shorts_candidates", [])
