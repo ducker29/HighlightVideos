@@ -92,6 +92,7 @@ def parse_time(value):
 PROFILE_NAMES = ("highlights", "shorts")
 
 DEFAULT_PROFILE = {
+    "enabled": True,
     "aspect_ratio": "16:9",
     "min_duration_sec": 120,
     "max_duration_sec": 300,
@@ -123,6 +124,7 @@ def normalize_profiles(raw):
     highlights = dict(DEFAULT_PROFILE)
     if "highlights" in raw:
         highlights.update(raw["highlights"])
+    highlights["enabled"] = bool(highlights["enabled"])
     highlights["min_duration_sec"] = int(highlights["min_duration_sec"])
     highlights["max_duration_sec"] = int(highlights["max_duration_sec"])
     highlights["end_padding_sec"] = float(highlights["end_padding_sec"])
@@ -157,6 +159,14 @@ def normalize_profiles(raw):
 def profile_settings(settings):
     """Плоские настройки → структура профилей (обратная совместимость)."""
     return normalize_profiles(settings.get("outputs"))
+
+
+def analysis_profiles(settings):
+    """Validate requested analysis formats without restricting historical reports."""
+    profiles = normalize_profiles(settings.get("outputs"))
+    if not any(profile["enabled"] for profile in profiles.values()):
+        raise ValueError("Включите хотя бы один формат: хайлайты или Shorts.")
+    return profiles
 
 
 def report_profiles(report):

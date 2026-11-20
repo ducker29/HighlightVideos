@@ -34,7 +34,7 @@ def settings_for(mode):
         base["outputs"] = {"highlights": {"min_duration_sec": 20, "max_duration_sec": 60},
                            "shorts": {"enabled": False}}
     elif mode == "shorts_only":
-        base["outputs"] = {"highlights": {"min_duration_sec": 20, "max_duration_sec": 60},
+        base["outputs"] = {"highlights": {"enabled": False, "min_duration_sec": 20, "max_duration_sec": 60},
                            "shorts": {"enabled": True, "min_duration_sec": 15,
                                       "target_duration_sec": 30, "max_duration_sec": 60}}
     else:
@@ -197,7 +197,7 @@ class Stage7ModeTests(unittest.TestCase):
         """When only Shorts is requested, Highlights PASS 2 (select_intervals/collect_clips)
         must NOT be invoked, while Shorts PASS (select_shorts) MUST run."""
         fake_http, _ = make_fake_http()
-        settings = settings_for("both")  # both enabled so both branches are *eligible*
+        settings = settings_for("shorts_only")
         transcript = make_transcript()
 
         highlights_pass2_called = []
@@ -230,26 +230,14 @@ class Stage7ModeTests(unittest.TestCase):
                  patch("analyzer.list_models", return_value=["test"]), \
                  patch.object(interval_selector, "select_intervals", side_effect=spy_select_intervals), \
                  patch.object(shorts_selector, "select_shorts", side_effect=spy_select_shorts):
-                # We need to force highlights branch to be skipped.
-                # Architecture check: analyzer.py has NO "highlights_enabled" flag;
-                # the highlights PASS 2 always runs when analyze() is called.
-                # So for a true "shorts-only" mode we must verify that when
-                # select_intervals raises (simulating it being unavailable/disabled),
-                # the analyze() function still produces shorts candidates.
-                # But first, let's just verify the *current* behavior:
-                # with both enabled, both are called.
                 path = analyze(job, transcript, settings, lambda m: None,
                                selection_method="intervals")
             report = load_json(path)
 
-            # In current architecture BOTH are always called when both are enabled.
-            # The "shorts-only" mode is achieved by the *user* not approving highlights,
-            # not by skipping the LLM pass. Verify that at minimum shorts ran:
             self.assertGreater(len(shorts_pass_called), 0,
                                "Shorts PASS must be invoked when shorts are enabled")
-            self.assertGreater(len(highlights_pass2_called), 0,
-                               "Highlights PASS 2 is invoked in current architecture "
-                               "(no independent enable flag exists)")
+            self.assertEqual(highlights_pass2_called, [],
+                             "Highlights PASS 2 must be skipped in Shorts-only mode")
         finally:
             interval_selector.select_intervals = original_select_intervals
             shorts_selector.select_shorts = original_select_shorts

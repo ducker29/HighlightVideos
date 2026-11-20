@@ -8,7 +8,7 @@ from job_store import analysis_bounds, load_json, save_json, timecode
 from transcriber import check_runtime, transcribe
 from editorial_review import review_report
 from clip_padding import padding_seconds, prepare_review_report
-from job_store import migrate_report
+from job_store import migrate_report, analysis_profiles
 
 
 def release_llm_for_asr(settings, log):
@@ -23,6 +23,7 @@ def release_llm_for_asr(settings, log):
 
 
 def run_analysis(settings, log):
+    profiles = analysis_profiles(settings)
     if not 1 <= settings["min_duration_sec"] <= settings["max_duration_sec"] <= 480:
         raise ValueError("Нужна длительность: 1 ≤ минимум ≤ максимум ≤ 480 секунд.")
     analysis_bounds(settings)
@@ -50,10 +51,11 @@ def run_analysis(settings, log):
         transcript = transcribe(job_dir, manifest, settings, log, start_sec=start_sec, end_sec=end_sec)
         save_json(state, {"stage": "analyzing", "settings": settings})
         report_path = analyze(job_dir, transcript, settings, log)
-        save_json(state, {"stage": "editorial_review", "settings": settings})
-        report_path = review_report(report_path, log, model=settings.get("editorial_model"))
-        save_json(state, {"stage": "end_padding", "settings": settings})
-        report_path = prepare_review_report(report_path, settings.get("end_padding_sec", 0.5), log)
+        if profiles["highlights"]["enabled"]:
+            save_json(state, {"stage": "editorial_review", "settings": settings})
+            report_path = review_report(report_path, log, model=settings.get("editorial_model"))
+            save_json(state, {"stage": "end_padding", "settings": settings})
+            report_path = prepare_review_report(report_path, settings.get("end_padding_sec", 0.5), log)
         save_json(state, {"stage": "awaiting_review", "report": str(report_path)})
     except Exception as exc:
         save_json(state, {"stage": "failed", "error": str(exc), "settings": settings})

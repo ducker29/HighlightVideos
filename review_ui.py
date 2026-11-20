@@ -142,7 +142,13 @@ class HighlightApp:
         # Настройки Shorts
         shorts_settings = ttk.Frame(settings)
         shorts_settings.grid(row=6, column=0, columnspan=6, sticky="ew", pady=4)
-        self.shorts_enabled_var = tk.BooleanVar(value=self.settings.get("shorts_enabled", False))
+        from job_store import normalize_profiles
+        profiles = normalize_profiles(self.settings.get("outputs"))
+        self.highlights_enabled_var = tk.BooleanVar(value=profiles["highlights"]["enabled"])
+        self.shorts_enabled_var = tk.BooleanVar(value=profiles["shorts"]["enabled"])
+        checkbox = ttk.Checkbutton(shorts_settings, text="Включить хайлайты", variable=self.highlights_enabled_var)
+        checkbox.grid(row=1, column=0, padx=(0, 12), sticky="w")
+        self.controls.append(checkbox)
         checkbox = ttk.Checkbutton(shorts_settings, text="Включить Shorts 9:16", variable=self.shorts_enabled_var)
         checkbox.grid(row=0, column=0, padx=(0, 12), sticky="w")
         self.controls.append(checkbox)
@@ -307,6 +313,10 @@ class HighlightApp:
 
     def restore_report_settings(self, context):
         settings = context["report"]["settings"]
+        from job_store import normalize_profiles
+        profiles = normalize_profiles(settings.get("outputs"))
+        self.highlights_enabled_var.set(profiles["highlights"]["enabled"])
+        self.shorts_enabled_var.set(profiles["shorts"]["enabled"])
         for key, value in settings.items():
             if key in self.variables:
                 self.variables[key].set(value)
@@ -422,7 +432,7 @@ class HighlightApp:
             self.variables["local_video_path"].set(path)
 
     def read_settings(self):
-        settings = {key: variable.get().strip() for key, variable in self.variables.items() if key != "analyze_full_video"}
+        settings = {key: variable.get().strip() for key, variable in self.variables.items() if key not in ("analyze_full_video", "outputs")}
         settings["analyze_full_video"] = self.variables["analyze_full_video"].get()
         settings["end_padding_sec"] = padding_seconds(settings["end_padding_sec"])
         analysis_bounds(settings)
@@ -441,21 +451,23 @@ class HighlightApp:
             raise ValueError("Укажите YouTube-ссылку или путь к локальному видеофайлу.")
         if not all(settings[k] for k in ("asr_model", "llm_model", "ollama_url")):
             raise ValueError("Заполните названия моделей и адрес Ollama.")
+        settings["outputs"] = {"highlights": {"enabled": self.highlights_enabled_var.get()},
+                               "shorts": {"enabled": False}}
         # Shorts настройки
         if self.shorts_enabled_var.get():
-            settings["outputs"] = {
-                "shorts": {
-                    "enabled": True,
-                    "aspect_ratio": "9:16",
-                    "min_duration_sec": int(settings.get("shorts_min_duration_sec", 20)),
-                    "target_duration_sec": int(settings.get("shorts_target_duration_sec", 40)),
-                    "max_duration_sec": int(settings.get("shorts_max_duration_sec", 60)),
-                    "crop_mode": "center",
-                    "subtitles_enabled": True,
-                    "max_candidates": 30,
-                    "final_candidates": 10,
-                }
+            settings["outputs"]["shorts"] = {
+                "enabled": True,
+                "aspect_ratio": "9:16",
+                "min_duration_sec": int(settings.get("shorts_min_duration_sec", 20)),
+                "target_duration_sec": int(settings.get("shorts_target_duration_sec", 40)),
+                "max_duration_sec": int(settings.get("shorts_max_duration_sec", 60)),
+                "crop_mode": "center",
+                "subtitles_enabled": True,
+                "max_candidates": 30,
+                "final_candidates": 10,
             }
+        from job_store import analysis_profiles
+        analysis_profiles(settings)
         return settings
 
     def refresh_models(self):

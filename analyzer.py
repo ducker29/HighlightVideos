@@ -244,6 +244,12 @@ def collect_clips(settings, prompt, sentences, duration, audit_path, log, label)
 
 
 def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
+    from job_store import analysis_profiles
+    from shorts_selector import shorts_cache_signature
+    profiles = analysis_profiles(settings)
+    highlights_enabled = profiles["highlights"]["enabled"]
+    shorts_enabled = profiles["shorts"]["enabled"]
+    requested_formats = [name for name, profile in profiles.items() if profile["enabled"]]
     window_signature = hashlib.sha256(json.dumps({"transcript": transcript, "model": settings["llm_model"],
         "min": settings["min_duration_sec"], "max": settings["max_duration_sec"],
         "version": PROMPT_VERSION}, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
@@ -260,10 +266,19 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
         signature = "iv1_" + hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:20]
     else:
         signature = window_signature
+    # Isolate new format-aware reports from historical reports and human decisions.
+    report_key = {"base": signature, "formats": requested_formats,
+                  "shorts": shorts_cache_signature(settings) if shorts_enabled else None}
+    signature = "formats_v1_" + hashlib.sha256(json.dumps(report_key, sort_keys=True).encode()).hexdigest()[:20]
     cache = job_dir / "analysis" / signature
     cache.mkdir(parents=True, exist_ok=True)
     report_path = cache / "report.json"
     if report_path.exists():
+        saved = load_json(report_path)
+        fields = {"highlights": "candidates", "shorts": "shorts_candidates"}
+        if (not set(requested_formats).issubset(saved.get("analyzed_formats", [])) or
+                any(not isinstance(saved.get(fields[name]), list) for name in requested_formats)):
+            raise ValueError("Кеш отчёта не содержит всех запрошенных форматов. Существующий отчёт сохранён; откройте его отдельно.")
         log("Используются сохранённые кандидаты и решения ревью.")
         return report_path
     if settings["llm_model"] not in list_models(settings["ollama_url"]):
@@ -325,7 +340,7 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
     analysis_complete = not analysis_warnings
     # Leave room for a complete maximum-length clip in a bounded block.
     blocks = merge_windows(analyzed, maximum_span=max(900, settings["max_duration_sec"] + 300))
-    for index, block in enumerate(blocks):
+    for index, block in enumerate(blocks if highlights_enabled else []):
         log(f"PASS 2: тематический блок {index + 1}/{len(blocks)}")
         try:
             if selection_method == "intervals":
@@ -377,18 +392,18 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
             analysis_warnings.append(warning)
             analysis_complete = False
     ranked = []
-    for candidate in sorted(candidates, key=lambda c: c["score"], reverse=True):
-        if not any(interval_iou(candidate, kept) >= 0.35 for kept in ranked):
-            ranked.append(candidate)
-        if len(ranked) >= 25:
-            break
-    for index, candidate in enumerate(ranked, 1):
-        candidate["candidate_id"] = f"c{index:03d}"
+    if highlights_enabled:
+        for candidate in sorted(candidates, key=lambda c: c["score"], reverse=True):
+            if not any(interval_iou(candidate, kept) >= 0.35 for kept in ranked):
+                ranked.append(candidate)
+            if len(ranked) >= 25:
+                break
+        for index, candidate in enumerate(ranked, 1):
+            candidate["candidate_id"] = f"c{index:03d}"
 
     # --- Independent Shorts pass: separate catalog, cache namespace, and ranking ---
     from job_store import normalize_profiles
     shorts_candidates = []
-    shorts_enabled = normalize_profiles(settings.get("outputs")).get("shorts", {}).get("enabled", True)
     if shorts_enabled:
         from shorts_selector import select_shorts, shorts_full_key
         shorts_key = shorts_full_key(window_signature, settings)
@@ -414,6 +429,7 @@ def analyze(job_dir, transcript, settings, log, selection_method="intervals"):
                 candidate["candidate_id"] = f"sc{index:03d}"
             log(f"PASS-Shorts: найдено {len(shorts_candidates)} кандидатов на Shorts.")
     report = {"schema": 1, "video_id": transcript["video_id"], "settings": settings,
+              "analyzed_formats": requested_formats,
               "profiles": normalize_profiles(settings.get("outputs")),
               "signature": signature, "candidates": ranked,
               "shorts_candidates": shorts_candidates,

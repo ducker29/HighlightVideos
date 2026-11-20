@@ -19,6 +19,7 @@ class ProfileNormalizationTests(unittest.TestCase):
     def test_absent_outputs_give_legacy_16_9_and_disabled_shorts(self):
         profiles = normalize_profiles(None)
         self.assertEqual(profiles["highlights"], {
+            "enabled": True,
             "aspect_ratio": "16:9",
             "min_duration_sec": 120,
             "max_duration_sec": 300,
