@@ -90,7 +90,7 @@ class SubsSettingsWindow:
         # A toplevel binding sees descendant events without a process-wide bind_all.
         self.top.bind("<MouseWheel>", self._scroll_settings, add="+")
         self.top.bind("<FocusIn>", self._reveal_setting, add="+")
-        labels = {"font": "Font", "font_size": "Font Size (ASS 384×288)",
+        labels = {"font": "Font", "font_size": "Font Size (ASS 384×288)", "text_color": "Цвет текста",
                   "position_mode": "Позиционирование", "x": "Position X (%)", "y": "Position Y (%)",
                   "background_enabled": "Прямоугольная подложка", "background_color": "Background Color",
                   "background_opacity": "Background Opacity (%)",
@@ -102,15 +102,18 @@ class SubsSettingsWindow:
                   "area_enabled": "Ограничить область субтитров",
                   "width_percent": "Ширина области (%)", "height_percent": "Высота области (%)",
                   "highlight_word_enabled": "Менять цвет текущего слова",
-                  "highlight_word_color": "Цвет текущего слова"}
+                   "highlight_word_color": "Цвет текущего слова",
+                   "shadow_enabled": "Тень под текстом",
+                   "shadow_color": "Цвет тени", "shadow_size": "Размер тени (ASS, 0–20)"}
         sections = (
-            ("Шрифт и позиционирование", ("font", "font_size", "position_mode", "x", "y")),
+            ("Шрифт и позиционирование", ("font", "font_size", "text_color", "position_mode", "x", "y")),
             ("Подложка субтитров", ("background_enabled", "background_color", "background_opacity",
                                     "background_padding_x_px", "background_padding_y_px", "area_enabled",
                                     "width_percent", "height_percent", "background_fill_region",
                                     "background_corner_radius_px")),
             ("Обводка и дополнительные эффекты", ("outline_enabled", "outline_color",
                                                      "highlight_word_enabled", "highlight_word_color")),
+            ("Тень под текстом", ("shadow_enabled", "shadow_color", "shadow_size")),
         )
         self.sections = []
         self.field_widgets = {}
@@ -143,7 +146,7 @@ class SubsSettingsWindow:
             if key in ("x", "y", "background_opacity", "width_percent", "height_percent"):
                 ttk.Scale(frame, from_=1 if key.endswith("_percent") else 0, to=100,
                           variable=var).grid(row=row, column=2, sticky="ew")
-            if key in ("background_color", "outline_color", "highlight_word_color"):
+            if key in ("text_color", "background_color", "outline_color", "highlight_word_color", "shadow_color"):
                 ttk.Button(frame, text="Выбрать цвет", command=lambda k=key: self.choose_color(k)).grid(row=row, column=2)
             self.traces.append((var, var.trace_add("write", lambda *_, k=key: self.changed(k))))
         self.geometry_notice = tk.StringVar()
@@ -251,7 +254,7 @@ class SubsSettingsWindow:
 
     def current(self):
         values = {key: var.get() for key, var in self.variables.items()}
-        for key in ("font_size", "x", "y", "background_opacity", "width_percent", "height_percent") + BACKGROUND_GEOMETRY_FIELDS:
+        for key in ("font_size", "x", "y", "background_opacity", "width_percent", "height_percent", "shadow_size") + BACKGROUND_GEOMETRY_FIELDS:
             try:
                 values[key] = float(values[key])
             except ValueError as exc:
@@ -274,6 +277,12 @@ class SubsSettingsWindow:
     def changed(self, key=None):
         if self.closed:
             return
+        if key == "shadow_enabled" and self.variables["shadow_enabled"].get():
+            try:
+                if float(self.variables["shadow_size"].get()) == 0:
+                    self.variables["shadow_size"].set("2")
+            except ValueError:
+                pass  # Leave invalid input for the standard validation message.
         if ((key in BACKGROUND_GEOMETRY_FIELDS
              or key == "background_fill_region" and self.variables["background_fill_region"].get())
                 and self.variables["background_geometry_mode"].get() != "custom"):
@@ -343,7 +352,10 @@ class SubsSettingsWindow:
         self.timer = self.top.after(100, self.poll)
 
     def choose_color(self, key="background_color"):
-        color = colorchooser.askcolor(parent=self.top, title="Цвет обводки" if key == "outline_color" else "Background Color")[1]
+        titles = {"text_color": "Цвет текста", "outline_color": "Цвет обводки",
+                  "shadow_color": "Цвет тени",
+                  "highlight_word_color": "Цвет текущего слова", "background_color": "Background Color"}
+        color = colorchooser.askcolor(parent=self.top, title=titles[key])[1]
         if color:
             self.variables[key].set(color)
 

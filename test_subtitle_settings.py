@@ -18,6 +18,92 @@ from subs_settings_window import SubsSettingsWindow, render_preview
 
 
 class SettingsTests(unittest.TestCase):
+    def test_shadow_toggle_persistence_and_v7_migration(self):
+        enabled = replace(DEFAULTS, shadow_enabled=True, shadow_size=3, shadow_color="#123456")
+        disabled = replace(enabled, shadow_enabled=False)
+        self.assertEqual(from_document(document(disabled)), disabled)
+        self.assertTrue(uses_legacy_srt_style(disabled))
+        self.assertFalse(uses_legacy_srt_style(enabled))
+        for value in (0, 1, "true", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                replace(DEFAULTS, shadow_enabled=value)
+        for size in (0, 3):
+            old = asdict(replace(enabled, shadow_size=size))
+            old.pop("shadow_enabled")
+            migrated = from_document({"schema_version": 7, "shorts": old})
+            self.assertEqual(migrated.shadow_enabled, size > 0)
+            self.assertEqual(migrated.shadow_size, size)
+            self.assertEqual(migrated.shadow_color, enabled.shadow_color)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg required")
+    def test_shadow_visible_in_synthetic_preview_without_outline(self):
+        from io import BytesIO
+        from PIL import Image
+        settings = replace(DEFAULTS, outline_enabled=False, shadow_enabled=True, shadow_color="#FF0000", shadow_size=3)
+        def red_pixels(style):
+            image = Image.open(BytesIO(render_preview(style))).convert("RGB")
+            pixels = image.tobytes()
+            return sum(r > 120 and r > g * 1.5 and r > b * 1.5
+                       for r, g, b in zip(pixels[::3], pixels[1::3], pixels[2::3]))
+        self.assertGreater(red_pixels(settings), 30)
+        self.assertEqual(red_pixels(replace(settings, shadow_size=0)), 0)
+        self.assertEqual(red_pixels(replace(settings, shadow_enabled=False)), 0)
+
+    def test_shadow_validation_presets_and_ass(self):
+        for value in (-1, 21, True, "2", None, float("nan"), float("inf")):
+            with self.subTest(size=value), self.assertRaises(ValueError):
+                replace(DEFAULTS, shadow_size=value)
+        for color in ("black", "#12345", None):
+            with self.subTest(color=color), self.assertRaises(ValueError):
+                replace(DEFAULTS, shadow_color=color)
+        settings = replace(DEFAULTS, shadow_enabled=True, shadow_size=2.5, shadow_color="#123456", outline_enabled=False)
+        self.assertEqual(from_document(document(settings)), settings)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shadow.json"
+            save_settings(path, settings)
+            self.assertEqual(load_settings(path), settings)
+        old = asdict(replace(DEFAULTS, text_color="#AABBCC"))
+        old.pop("shadow_color")
+        old.pop("shadow_size")
+        old.pop("shadow_enabled")
+        loaded = from_document({"schema_version": 6, "shorts": old})
+        self.assertEqual(loaded.text_color, "#AABBCC")
+        self.assertEqual(loaded.shadow_size, 0)
+        self.assertTrue(uses_legacy_srt_style(replace(DEFAULTS, shadow_color="#ABCDEF")))
+        self.assertFalse(uses_legacy_srt_style(settings))
+        ass = build_ass("1\n00:00:00,000 --> 00:00:01,000\nТекст\n", settings)
+        style = next(line for line in ass.splitlines() if line.startswith("Style: Text,"))
+        fields = style.split(",")
+        self.assertEqual(fields[6], "&H00563412&")
+        self.assertEqual(fields[15:18], ["1", "0", "2.5"])
+
+    def test_text_color_roundtrip_legacy_and_word_reset(self):
+        custom = replace(DEFAULTS, text_color="#12AB34", highlight_word_enabled=True,
+                         highlight_word_color="#FF0000")
+        self.assertEqual(from_document(document(custom)), custom)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "colored.json"
+            save_settings(path, custom)
+            self.assertEqual(load_settings(path), custom)
+        old = asdict(DEFAULTS)
+        old.pop("text_color")
+        old.pop("shadow_color")
+        old.pop("shadow_size")
+        old.pop("shadow_enabled")
+        self.assertEqual(from_document({"schema_version": 5, "shorts": old}).text_color, "#FFFFFF")
+        for color in ("red", "#12345", None, 123):
+            with self.subTest(color=color), self.assertRaises(ValueError):
+                replace(DEFAULTS, text_color=color)
+        self.assertFalse(uses_legacy_srt_style(custom))
+        self.assertFalse(uses_legacy_srt_style(replace(DEFAULTS, text_color="#12AB34")))
+        srt = "1\n00:00:00,000 --> 00:00:02,000\nПервое второе\n"
+        cues = [[{"word": "Первое", "start": 0, "end": 1},
+                 {"word": "второе", "start": 1, "end": 2}]]
+        ass = build_ass(srt, custom, cues)
+        self.assertIn("Style: Text,Arial,18,&H0034AB12&", ass)
+        self.assertIn(r"{\1c&H000000FF&}Первое{\1c&H0034AB12&} второе", ass)
+        self.assertNotIn(r"{\1c&H00FFFFFF&}", ass)
+
     def test_validation(self):
         for key, value in (("font", ""), ("font", "Arial,Outline=99"), ("font", "A\nB"),
                            ("font_size", 0), ("font_size", -1), ("font_size", float("nan")),
@@ -51,14 +137,14 @@ class SettingsTests(unittest.TestCase):
                       if k not in {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent",
                                    "highlight_word_enabled", "highlight_word_color", "background_padding_x_px",
                                    "background_padding_y_px", "background_corner_radius_px", "background_geometry_mode",
-                                   "background_fill_region"}}
+                                    "background_fill_region", "text_color", "shadow_color", "shadow_size", "shadow_enabled"}}
         self.assertEqual(from_document({"schema_version": 1, "shorts": old_fields}), DEFAULTS)
         old_fields.update(position_mode="free", x=40, y=65, background_enabled=True)
         migrated = from_document({"schema_version": 1, "shorts": old_fields})
         self.assertFalse(migrated.area_enabled)
         self.assertTrue(migrated.outline_enabled)
         self.assertEqual(migrated.y, 65)
-        self.assertEqual(document(migrated)["schema_version"], 5)
+        self.assertEqual(document(migrated)["schema_version"], 8)
         with self.assertRaises(ValueError):
             from_document({"schema_version": 2, "shorts": old_fields})
 
@@ -103,15 +189,19 @@ class SettingsTests(unittest.TestCase):
         events = [line for line in ass.splitlines() if line.startswith("Dialogue: 1")]
         self.assertEqual(len(events), 3)
         self.assertIn("0:00:00.00,0:00:00.50", events[0])
-        self.assertIn(r"{\1c&H00563412&}Первое{\1c&HFFFFFF&} второе", events[0])
+        self.assertIn(r"{\1c&H00563412&}Первое{\1c&H00FFFFFF&} второе", events[0])
         self.assertIn("0:00:00.50,0:00:00.80", events[1])
         self.assertNotIn(r"\1c", events[1])
-        self.assertIn(r"Первое {\1c&H00563412&}второе{\1c&HFFFFFF&}", events[2])
+        self.assertIn(r"Первое {\1c&H00563412&}второе{\1c&H00FFFFFF&}", events[2])
         self.assertIn("0:00:00.80,0:00:02.00", events[2])
         self.assertNotIn(r"\1c", build_ass(srt, DEFAULTS, cues))
 
     def test_v2_migration_and_highlight_validation(self):
         fields = asdict(DEFAULTS)
+        fields.pop("text_color")
+        fields.pop("shadow_color")
+        fields.pop("shadow_size")
+        fields.pop("shadow_enabled")
         fields.pop("highlight_word_enabled")
         fields.pop("highlight_word_color")
         for key in ("background_padding_x_px", "background_padding_y_px", "background_corner_radius_px",
@@ -146,7 +236,7 @@ class SettingsTests(unittest.TestCase):
             path = Path(directory) / "preset.json"
             save_settings(path, custom)
             stored = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(stored, {"schema_version": 5, "shorts": asdict(custom)})
+            self.assertEqual(stored, {"schema_version": 8, "shorts": asdict(custom)})
             loaded = load_settings(path)
             self.assertEqual(loaded, custom)
             self.assertFalse(loaded.background_enabled)
@@ -158,7 +248,7 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(getattr(DEFAULTS, key), 0)
             save_settings(path, DEFAULTS)
             self.assertEqual(load_settings(path), DEFAULTS)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema_version"], 5)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema_version"], 8)
 
     def test_all_old_versions_load_without_rewrite_and_save_as_v5(self):
         geometry = {"background_padding_x_px", "background_padding_y_px",
@@ -179,7 +269,7 @@ class SettingsTests(unittest.TestCase):
                 if version == 4:
                     expected = replace(expected, background_geometry_mode=mode, background_padding_x_px=37.5,
                                        background_padding_y_px=4.25, background_corner_radius_px=128)
-                missing = ({"background_fill_region"} | (geometry if version < 4 else set())
+                missing = ({"background_fill_region", "text_color", "shadow_color", "shadow_size", "shadow_enabled"} | (geometry if version < 4 else set())
                            | (v3 if version < 3 else set()) | (v2 if version < 2 else set()))
                 fields = {key: value for key, value in asdict(expected).items() if key not in missing}
                 path = Path(directory) / "old.json"
@@ -199,7 +289,7 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(build_ass(srt, loaded), build_ass(srt, expected))
                 self.assertFalse(uses_legacy_srt_style(loaded))  # Enabled legacy box still needs ASS.
                 save_settings(path, loaded)  # Explicit Save/Apply, including the same old path.
-                self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema_version"], 5)
+                self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["schema_version"], 8)
                 self.assertEqual(load_settings(path), expected)
 
     def test_schema_field_sets_are_strict_for_every_version(self):
@@ -207,8 +297,14 @@ class SettingsTests(unittest.TestCase):
                     "background_corner_radius_px", "background_geometry_mode"}
         added = {"outline_enabled", "outline_color", "area_enabled", "width_percent", "height_percent"}
         highlight = {"highlight_word_enabled", "highlight_word_color"}
-        for version in (1, 2, 3, 4, 5):
+        for version in (1, 2, 3, 4, 5, 6, 7, 8):
             missing = (geometry if version < 4 else set()) | (highlight if version < 3 else set())
+            if version < 8:
+                missing.add("shadow_enabled")
+            if version < 7:
+                missing |= {"shadow_color", "shadow_size"}
+            if version < 6:
+                missing.add("text_color")
             if version < 5:
                 missing.add("background_fill_region")
             if version == 1:
@@ -233,7 +329,7 @@ class SettingsTests(unittest.TestCase):
             for value in invalid:
                 with self.subTest(version=version, document=value), self.assertRaises(ValueError):
                     from_document(value)
-        for version in (True, 5.0, "5", 0, 6):
+        for version in (True, 8.0, "8", 0, 9):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 from_document({"schema_version": version, "shorts": asdict(DEFAULTS)})
 
@@ -280,7 +376,7 @@ class SettingsTests(unittest.TestCase):
         for value in (0, 1, "true", "false", "", None, [], {}, 1.0):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ValueError, "boolean"):
-                    from_document({"schema_version": 5,
+                    from_document({"schema_version": 8,
                                    "shorts": {**asdict(custom), "background_fill_region": value}})
                 with self.assertRaisesRegex(ValueError, "boolean"):
                     replace(custom, background_fill_region=value)
@@ -293,7 +389,7 @@ class SettingsTests(unittest.TestCase):
                         replace(DEFAULTS, **values)
                     fields = {**asdict(DEFAULTS), **values}
                     with self.assertRaisesRegex(ValueError, "custom"):
-                        from_document({"schema_version": 5, "shorts": fields})
+                        from_document({"schema_version": 8, "shorts": fields})
                     saved = replace(custom, **values)
                     self.assertTrue(from_document(document(saved)).background_fill_region)
 
@@ -329,6 +425,47 @@ class SettingsTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
+    def test_shadow_section_is_last_and_applies(self):
+        self.assertEqual(self.window.sections[-1].cget("text"), "Тень под текстом")
+        self.assertIs(self.window.field_widgets["shadow_size"].master, self.window.sections[-1])
+        with patch("subs_settings_window.colorchooser.askcolor", return_value=((18, 52, 86), "#123456")):
+            self.window.choose_color("shadow_color")
+        self.window.variables["shadow_size"].set("2.5")
+        self.window.variables["shadow_enabled"].set(True)
+        self.window.apply()
+        self.assertTrue(self.applied[-1].shadow_enabled)
+        self.assertEqual(self.applied[-1].shadow_color, "#123456")
+        self.assertEqual(self.applied[-1].shadow_size, 2.5)
+        self.window.populate(DEFAULTS)
+        self.assertEqual(self.window.current().shadow_size, 0)
+
+    def test_shadow_checkbox_first_and_preserves_size_when_disabled(self):
+        checkbox = self.window.field_widgets["shadow_enabled"]
+        self.assertEqual(checkbox.winfo_class(), "TCheckbutton")
+        self.assertEqual(int(checkbox.grid_info()["row"]), 0)
+        self.assertFalse(self.window.current().shadow_enabled)
+        self.window.variables["shadow_enabled"].set(True)
+        self.assertEqual(self.window.current().shadow_size, 2)
+        self.window.variables["shadow_size"].set("4.5")
+        self.window.variables["shadow_color"].set("#123456")
+        self.window.variables["shadow_enabled"].set(False)
+        self.window.apply()
+        self.assertFalse(self.applied[-1].shadow_enabled)
+        self.assertEqual(self.applied[-1].shadow_size, 4.5)
+        self.assertEqual(self.applied[-1].shadow_color, "#123456")
+        self.window.variables["shadow_enabled"].set(True)
+        self.assertEqual(self.window.current().shadow_size, 4.5)
+
+    def test_text_color_picker_apply_and_defaults(self):
+        with patch("subs_settings_window.colorchooser.askcolor", return_value=((18, 171, 52), "#12ab34")) as picker:
+            self.window.choose_color("text_color")
+        self.assertEqual(picker.call_args.kwargs["title"], "Цвет текста")
+        self.assertEqual(self.window.current().text_color, "#12ab34")
+        self.window.apply()
+        self.assertEqual(self.applied[-1].text_color, "#12ab34")
+        self.window.populate(DEFAULTS)
+        self.assertEqual(self.window.variables["text_color"].get(), "#FFFFFF")
+
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
@@ -354,15 +491,16 @@ class WindowTests(unittest.TestCase):
 
     def test_sections_contain_all_existing_fields(self):
         expected = (
-            ("Шрифт и позиционирование", ("font", "font_size", "position_mode", "x", "y")),
+            ("Шрифт и позиционирование", ("font", "font_size", "text_color", "position_mode", "x", "y")),
             ("Подложка субтитров", ("background_enabled", "background_color", "background_opacity",
                                     "background_padding_x_px", "background_padding_y_px", "area_enabled",
                                     "width_percent", "height_percent", "background_fill_region",
                                     "background_corner_radius_px")),
             ("Обводка и дополнительные эффекты", ("outline_enabled", "outline_color",
                                                      "highlight_word_enabled", "highlight_word_color")),
+            ("Тень под текстом", ("shadow_enabled", "shadow_color", "shadow_size")),
         )
-        self.assertEqual(len(self.window.sections), 3)
+        self.assertEqual(len(self.window.sections), 4)
         self.assertEqual(set(self.window.variables), set(asdict(DEFAULTS)))
         self.assertEqual(set(self.window.field_widgets), set(asdict(DEFAULTS)) - {"background_geometry_mode"})
         for section, (title, keys) in zip(self.window.sections, expected):
@@ -546,7 +684,7 @@ class WindowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for version in (1, 2, 3, 4):
                 with self.subTest(version=version):
-                    missing = ({"background_fill_region"} | (geometry if version < 4 else set())
+                    missing = ({"background_fill_region", "text_color", "shadow_color", "shadow_size", "shadow_enabled"} | (geometry if version < 4 else set())
                                | (highlight if version < 3 else set()) | (added if version < 2 else set()))
                     fields = {key: value for key, value in asdict(style).items() if key not in missing}
                     path = Path(directory) / f"v{version}.json"
@@ -599,7 +737,7 @@ class WindowTests(unittest.TestCase):
                     self.assertLess(canvas.yview()[1], 1)
                     canvas.yview_moveto(1)
                     self.root.update_idletasks()
-                    last = self.window.field_widgets["highlight_word_color"]
+                    last = self.window.field_widgets["shadow_size"]
                     self.assertGreaterEqual(last.winfo_rooty(), canvas.winfo_rooty())
                     self.assertLess(last.winfo_rooty() + last.winfo_height(),
                                     canvas.winfo_rooty() + canvas.winfo_height())
@@ -671,7 +809,7 @@ class WindowTests(unittest.TestCase):
                     patch("subs_settings_window.messagebox.showinfo"):
                 self.window.save()
             self.assertFalse(self.applied)
-            self.assertEqual(json.loads(Path(path).read_text(encoding="utf-8"))["schema_version"], 5)
+            self.assertEqual(json.loads(Path(path).read_text(encoding="utf-8"))["schema_version"], 8)
             self.window.populate(DEFAULTS)
             with patch("subs_settings_window.filedialog.askopenfilename", return_value=path):
                 self.window.load()

@@ -16,6 +16,7 @@ from pathlib import Path
 class SubtitleSettings:
     font: str = "Arial"
     font_size: float = 18
+    text_color: str = "#FFFFFF"
     position_mode: str = "historical"
     x: float = 50
     y: float = 16.6666666667
@@ -34,6 +35,9 @@ class SubtitleSettings:
     background_corner_radius_px: float = 0
     background_geometry_mode: str = "legacy"
     background_fill_region: bool = False
+    shadow_color: str = "#000000"
+    shadow_size: float = 0
+    shadow_enabled: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.font, str) or not self.font.strip()
@@ -44,7 +48,7 @@ class SubtitleSettings:
                                 ("width_percent", 1, 100), ("height_percent", 1, 100),
                                 ("background_padding_x_px", 0, 512),
                                 ("background_padding_y_px", 0, 512),
-                                ("background_corner_radius_px", 0, 512)):
+                                ("background_corner_radius_px", 0, 512), ("shadow_size", 0, 20)):
             value = getattr(self, name)
             if (type(value) not in (float, int) or not low <= value <= high
                     or not math.isfinite(value)):
@@ -55,12 +59,12 @@ class SubtitleSettings:
                 or self.background_geometry_mode not in ("legacy", "custom")):
             raise ValueError("background_geometry_mode: требуется legacy или custom.")
         for name in ("background_enabled", "outline_enabled", "area_enabled", "highlight_word_enabled",
-                     "background_fill_region"):
+                     "background_fill_region", "shadow_enabled"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} должен быть boolean.")
         if self.background_fill_region and self.background_geometry_mode == "legacy":
             raise ValueError("background_fill_region=True требует background_geometry_mode=custom.")
-        for name in ("background_color", "outline_color", "highlight_word_color"):
+        for name in ("text_color", "background_color", "outline_color", "highlight_word_color", "shadow_color"):
             color = getattr(self, name)
             if not isinstance(color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
                 raise ValueError(f"{name}: цвет должен иметь вид #RRGGBB.")
@@ -75,14 +79,14 @@ LEGACY_STYLE = ("FontName=Arial,FontSize=18,PrimaryColour=&HFFFFFF&,"
 
 
 def document(settings):
-    return {"schema_version": 5, "shorts": asdict(settings)}
+    return {"schema_version": 8, "shorts": asdict(settings)}
 
 
 def from_document(value):
     if not isinstance(value, dict) or set(value) != {"schema_version", "shorts"}:
         raise ValueError("Ожидается JSON-пресет Subs Settings.")
     version = value["schema_version"]
-    if type(version) is not int or version not in (1, 2, 3, 4, 5):
+    if type(version) is not int or version not in (1, 2, 3, 4, 5, 6, 7, 8):
         raise ValueError("Неподдерживаемая версия пресета.")
     fields = value["shorts"]
     defaults = asdict(DEFAULTS)
@@ -91,6 +95,12 @@ def from_document(value):
     geometry_fields = {"background_padding_x_px", "background_padding_y_px",
                        "background_corner_radius_px", "background_geometry_mode"}
     expected = set(defaults)
+    if version < 8:
+        expected.remove("shadow_enabled")
+    if version < 7:
+        expected -= {"shadow_color", "shadow_size"}
+    if version < 6:
+        expected.remove("text_color")
     if version < 5:
         expected.remove("background_fill_region")
     if version < 4:
@@ -101,7 +111,10 @@ def from_document(value):
         expected -= added_fields
     if not isinstance(fields, dict) or set(fields) != expected:
         raise ValueError("Неверный набор параметров субтитров.")
-    return SubtitleSettings(**(defaults | fields))
+    settings = SubtitleSettings(**(defaults | fields))
+    if version < 8:
+        settings = replace(settings, shadow_enabled=version == 7 and settings.shadow_size > 0)
+    return settings
 
 
 def effective_style(settings):
@@ -112,6 +125,11 @@ def effective_style(settings):
     This helper does not enable custom rendering or alter generated ASS.
     """
     inactive = set()
+    if not settings.shadow_enabled:
+        inactive.update(("shadow_color", "shadow_size"))
+    elif not settings.shadow_size:
+        inactive.add("shadow_color")
+        inactive.add("shadow_enabled")
     if not settings.background_enabled:
         inactive.update(("background_color", "background_opacity", "background_geometry_mode", "background_fill_region"))
     if not settings.background_enabled or settings.background_geometry_mode == "legacy":
@@ -213,8 +231,10 @@ def build_ass(srt, settings, word_cues=None):
         left, top, right, bottom = subtitle_area(s)
         left_margin, right_margin = left, 384 - right
     outline = ass_color(s.outline_color, 100)
-    header += (f"Style: Text,{s.font},{s.font_size},&H00FFFFFF,&H00FFFFFF,{outline},&H00000000,"
-               f"0,0,0,0,100,100,0,0,1,{int(s.outline_enabled)},0,{align},{left_margin},{right_margin},{margin},1\n")
+    primary = ass_color(s.text_color, 100)
+    shadow = ass_color(s.shadow_color, 100)
+    header += (f"Style: Text,{s.font},{s.font_size},{primary},{primary},{outline},{shadow},"
+               f"0,0,0,0,100,100,0,0,1,{int(s.outline_enabled)},{s.shadow_size if s.shadow_enabled else 0},{align},{left_margin},{right_margin},{margin},1\n")
     # The box layer is independent of the text's outline toggle and colour.
     bg = ass_color(s.background_color, s.background_opacity)
     header += (f"Style: Box,{s.font},{s.font_size},&HFFFFFFFF,&HFFFFFFFF,{bg},{bg},"
@@ -274,7 +294,7 @@ def build_ass(srt, settings, word_cues=None):
                         i, j = active
                         color = ass_color(s.highlight_word_color, 100)
                         content = (escape(raw[:i]) + "{\\1c" + color + "}" + escape(raw[i:j])
-                                   + r"{\1c&HFFFFFF&}" + escape(raw[j:]))
+                                   + "{\\1c" + primary + "}" + escape(raw[j:]))
                     variants.append((timestamp(a), timestamp(b), content))
         for layer, style in ((0, "Box"), (1, "Text")):
             if style == "Box" and not s.background_enabled:
